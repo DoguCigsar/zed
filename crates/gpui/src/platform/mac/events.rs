@@ -13,7 +13,7 @@ use core_graphics::{
     event_source::{CGEventSource, CGEventSourceStateID},
 };
 use ctor::ctor;
-use foreign_types::ForeignType;
+use metal::foreign_types::ForeignType as _;
 use objc::{class, msg_send, sel, sel_impl};
 use std::{borrow::Cow, ffi::CStr, mem, os::raw::c_char, ptr};
 
@@ -77,7 +77,7 @@ unsafe fn read_modifiers(native_event: id) -> Modifiers {
         control,
         alt,
         shift,
-        command,
+        platform: command,
         function,
     }
 }
@@ -131,6 +131,7 @@ impl PlatformInput {
                         ),
                         modifiers: read_modifiers(native_event),
                         click_count: native_event.clickCount() as usize,
+                        first_mouse: false,
                     })
                 })
             }
@@ -322,7 +323,7 @@ unsafe fn parse_keystroke(native_event: id) -> Keystroke {
             control,
             alt,
             shift,
-            command,
+            platform: command,
             function,
         },
         key,

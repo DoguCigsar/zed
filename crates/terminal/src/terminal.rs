@@ -1,5 +1,8 @@
 pub mod mappings;
+
 pub use alacritty_terminal;
+
+mod pty_info;
 pub mod terminal_settings;
 
 use alacritty_terminal::{
@@ -30,19 +33,21 @@ use mappings::mouse::{
     scroll_report,
 };
 
-use procinfo::LocalProcessInfo;
+use collections::{HashMap, VecDeque};
+use futures::StreamExt;
+use pty_info::PtyProcessInfo;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
+use smol::channel::{Receiver, Sender};
+use task::TaskId;
 use terminal_settings::{AlternateScroll, Shell, TerminalBlink, TerminalSettings};
 use theme::{ActiveTheme, Theme};
 use util::truncate_and_trailoff;
 
 use std::{
     cmp::{self, min},
-    collections::{HashMap, VecDeque},
     fmt::Display,
     ops::{Deref, Index, RangeInclusive},
-    os::unix::prelude::AsRawFd,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -65,7 +70,10 @@ actions!(
 ///Scrolling is unbearably sluggish by default. Alacritty supports a configurable
 ///Scroll multiplier that is set to 3 by default. This will be removed when I
 ///Implement scroll bars.
+#[cfg(target_os = "macos")]
 const SCROLL_MULTIPLIER: f32 = 4.;
+#[cfg(not(target_os = "macos"))]
+const SCROLL_MULTIPLIER: f32 = 1.;
 const MAX_SEARCH_LINES: usize = 100;
 const DEBUG_TERMINAL_WIDTH: Pixels = px(500.);
 const DEBUG_TERMINAL_HEIGHT: Pixels = px(30.);
@@ -134,7 +142,7 @@ pub fn init(cx: &mut AppContext) {
     TerminalSettings::register(cx);
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSize {
     pub cell_width: Pixels,
     pub line_height: Pixels,
@@ -151,11 +159,11 @@ impl TerminalSize {
     }
 
     pub fn num_lines(&self) -> usize {
-        f32::from((self.size.height / self.line_height).floor()) as usize
+        (self.size.height / self.line_height).floor() as usize
     }
 
     pub fn num_columns(&self) -> usize {
-        f32::from((self.size.width / self.cell_width).floor()) as usize
+        (self.size.width / self.cell_width).floor() as usize
     }
 
     pub fn height(&self) -> Pixels {
@@ -174,6 +182,7 @@ impl TerminalSize {
         self.line_height
     }
 }
+
 impl Default for TerminalSize {
     fn default() -> Self {
         TerminalSize::new(
@@ -277,20 +286,34 @@ impl Display for TerminalError {
     }
 }
 
+// https://github.com/alacritty/alacritty/blob/cb3a79dbf6472740daca8440d5166c1d4af5029e/extra/man/alacritty.5.scd?plain=1#L207-L213
+const DEFAULT_SCROLL_HISTORY_LINES: usize = 10_000;
+const MAX_SCROLL_HISTORY_LINES: usize = 100_000;
+
 pub struct TerminalBuilder {
     terminal: Terminal,
     events_rx: UnboundedReceiver<AlacTermEvent>,
 }
 
 impl TerminalBuilder {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         working_directory: Option<PathBuf>,
+        task: Option<TaskState>,
         shell: Shell,
-        env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         blink_settings: Option<TerminalBlink>,
         alternate_scroll: AlternateScroll,
+        max_scroll_history_lines: Option<usize>,
         window: AnyWindowHandle,
+        completion_tx: Sender<()>,
     ) -> Result<TerminalBuilder> {
+        // TODO: Properly set the current locale,
+        env.entry("LC_ALL".to_string())
+            .or_insert_with(|| "en_US.UTF-8".to_string());
+
+        env.insert("ZED_TERM".to_string(), "true".to_string());
+
         let pty_options = {
             let alac_shell = match shell.clone() {
                 Shell::System => None,
@@ -306,23 +329,26 @@ impl TerminalBuilder {
                 shell: alac_shell,
                 working_directory: working_directory.clone(),
                 hold: false,
+                env: env.into_iter().collect(),
             }
         };
 
-        // First, setup Alacritty's env
+        // Setup Alacritty's env
         setup_env();
 
-        // Then setup configured environment variables
-        for (key, value) in env {
-            std::env::set_var(key, value);
-        }
-        //TODO: Properly set the current locale,
-        std::env::set_var("LC_ALL", "en_US.UTF-8");
-        std::env::set_var("ZED_TERM", "true");
-
+        let scrolling_history = if task.is_some() {
+            // Tasks like `cargo build --all` may produce a lot of output, ergo allow maximum scrolling.
+            // After the task finishes, we do not allow appending to that terminal, so small tasks output should not
+            // cause excessive memory usage over time.
+            MAX_SCROLL_HISTORY_LINES
+        } else {
+            max_scroll_history_lines
+                .unwrap_or(DEFAULT_SCROLL_HISTORY_LINES)
+                .min(MAX_SCROLL_HISTORY_LINES)
+        };
         let config = Config {
-            scrolling_history: 10000,
-            ..Default::default()
+            scrolling_history,
+            ..Config::default()
         };
 
         //Spawn a task so the Alacritty EventLoop can communicate with us in a view context
@@ -363,8 +389,7 @@ impl TerminalBuilder {
             }
         };
 
-        let fd = pty.file().as_raw_fd();
-        let shell_pid = pty.child().id();
+        let pty_info = PtyProcessInfo::new(&pty);
 
         //And connect them together
         let event_loop = EventLoop::new(
@@ -380,25 +405,25 @@ impl TerminalBuilder {
         let _io_thread = event_loop.spawn(); // DANGER
 
         let url_regex = RegexSearch::new(r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#).unwrap();
-        let word_regex = RegexSearch::new(r#"[\w.\[\]:/@\-~]+"#).unwrap();
+        let word_regex = RegexSearch::new(r#"[\$\+\w.\[\]:/@\-~]+"#).unwrap();
 
         let terminal = Terminal {
+            task,
             pty_tx: Notifier(pty_tx),
+            completion_tx,
             term,
             events: VecDeque::with_capacity(10), //Should never get this high.
             last_content: Default::default(),
             last_mouse: None,
             matches: Vec::new(),
             selection_head: None,
-            shell_fd: fd as u32,
-            shell_pid,
-            foreground_process_info: None,
+            pty_info,
             breadcrumb_text: String::new(),
             scroll_px: px(0.),
             last_mouse_position: None,
             next_link_id: 0,
             selection_phase: SelectionPhase::Ended,
-            cmd_pressed: false,
+            secondary_pressed: false,
             hovered_word: false,
             url_regex,
             word_regex,
@@ -412,17 +437,15 @@ impl TerminalBuilder {
 
     pub fn subscribe(mut self, cx: &mut ModelContext<Terminal>) -> Terminal {
         //Event loop
-        cx.spawn(|this, mut cx| async move {
-            use futures::StreamExt;
-
+        cx.spawn(|terminal, mut cx| async move {
             while let Some(event) = self.events_rx.next().await {
-                this.update(&mut cx, |this, cx| {
+                terminal.update(&mut cx, |terminal, cx| {
                     //Process the first event immediately for lowered latency
-                    this.process_event(&event, cx);
+                    terminal.process_event(&event, cx);
                 })?;
 
                 'outer: loop {
-                    let mut events = vec![];
+                    let mut events = Vec::new();
                     let mut timer = cx
                         .background_executor()
                         .timer(Duration::from_millis(4))
@@ -449,21 +472,21 @@ impl TerminalBuilder {
                         }
                     }
 
-                    if events.is_empty() && wakeup == false {
+                    if events.is_empty() && !wakeup {
                         smol::future::yield_now().await;
                         break 'outer;
-                    } else {
-                        this.update(&mut cx, |this, cx| {
-                            if wakeup {
-                                this.process_event(&AlacTermEvent::Wakeup, cx);
-                            }
-
-                            for event in events {
-                                this.process_event(&event, cx);
-                            }
-                        })?;
-                        smol::future::yield_now().await;
                     }
+
+                    terminal.update(&mut cx, |this, cx| {
+                        if wakeup {
+                            this.process_event(&AlacTermEvent::Wakeup, cx);
+                        }
+
+                        for event in events {
+                            this.process_event(&event, cx);
+                        }
+                    })?;
+                    smol::future::yield_now().await;
                 }
             }
 
@@ -538,6 +561,7 @@ pub enum SelectionPhase {
 
 pub struct Terminal {
     pty_tx: Notifier,
+    completion_tx: Sender<()>,
     term: Arc<FairMutex<Term<ZedListener>>>,
     events: VecDeque<InternalEvent>,
     /// This is only used for mouse mode cell change detection
@@ -548,16 +572,50 @@ pub struct Terminal {
     pub last_content: TerminalContent,
     pub selection_head: Option<AlacPoint>,
     pub breadcrumb_text: String,
-    shell_pid: u32,
-    shell_fd: u32,
-    pub foreground_process_info: Option<LocalProcessInfo>,
+    pub pty_info: PtyProcessInfo,
     scroll_px: Pixels,
     next_link_id: usize,
     selection_phase: SelectionPhase,
-    cmd_pressed: bool,
+    secondary_pressed: bool,
     hovered_word: bool,
     url_regex: RegexSearch,
     word_regex: RegexSearch,
+    task: Option<TaskState>,
+}
+
+pub struct TaskState {
+    pub id: TaskId,
+    pub full_label: String,
+    pub label: String,
+    pub command_label: String,
+    pub status: TaskStatus,
+    pub completion_rx: Receiver<()>,
+}
+
+/// A status of the current terminal tab's task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatus {
+    /// The task had been started, but got cancelled or somehow otherwise it did not
+    /// report its exit code before the terminal event loop was shut down.
+    Unknown,
+    /// The task is started and running currently.
+    Running,
+    /// After the start, the task stopped running and reported its error code back.
+    Completed { success: bool },
+}
+
+impl TaskStatus {
+    fn register_terminal_exit(&mut self) {
+        if self == &Self::Running {
+            *self = Self::Unknown;
+        }
+    }
+
+    fn register_task_exit(&mut self, error_code: i32) {
+        *self = TaskStatus::Completed {
+            success: error_code == 0,
+        };
+    }
 }
 
 impl Terminal {
@@ -589,20 +647,23 @@ impl Terminal {
             AlacTermEvent::Bell => {
                 cx.emit(Event::Bell);
             }
-            AlacTermEvent::Exit => cx.emit(Event::CloseTerminal),
+            AlacTermEvent::Exit => self.register_task_finished(None, cx),
             AlacTermEvent::MouseCursorDirty => {
                 //NOOP, Handled in render
             }
             AlacTermEvent::Wakeup => {
                 cx.emit(Event::Wakeup);
 
-                if self.update_process_info() {
+                if self.pty_info.has_changed() {
                     cx.emit(Event::TitleChanged);
                 }
             }
             AlacTermEvent::ColorRequest(idx, fun_ptr) => {
                 self.events
                     .push_back(InternalEvent::ColorRequest(*idx, fun_ptr.clone()));
+            }
+            AlacTermEvent::ChildExit(error_code) => {
+                self.register_task_finished(Some(*error_code), cx);
             }
         }
     }
@@ -611,34 +672,8 @@ impl Terminal {
         self.selection_phase == SelectionPhase::Selecting
     }
 
-    /// Updates the cached process info, returns whether the Zed-relevant info has changed
-    fn update_process_info(&mut self) -> bool {
-        let mut pid = unsafe { libc::tcgetpgrp(self.shell_fd as i32) };
-        if pid < 0 {
-            pid = self.shell_pid as i32;
-        }
-
-        if let Some(process_info) = LocalProcessInfo::with_root_pid(pid as u32) {
-            let res = self
-                .foreground_process_info
-                .as_ref()
-                .map(|old_info| {
-                    process_info.cwd != old_info.cwd || process_info.name != old_info.name
-                })
-                .unwrap_or(true);
-
-            self.foreground_process_info = Some(process_info.clone());
-
-            res
-        } else {
-            false
-        }
-    }
-
-    fn get_cwd(&self) -> Option<PathBuf> {
-        self.foreground_process_info
-            .as_ref()
-            .map(|info| info.cwd.clone())
+    pub fn get_cwd(&self) -> Option<PathBuf> {
+        self.pty_info.current.as_ref().map(|info| info.cwd.clone())
     }
 
     ///Takes events from Alacritty and translates them to behavior on this view
@@ -659,7 +694,7 @@ impl Terminal {
                 new_size.size.height = cmp::max(new_size.line_height, new_size.height());
                 new_size.size.width = cmp::max(new_size.cell_width, new_size.width());
 
-                self.last_content.size = new_size.clone();
+                self.last_content.size = new_size;
 
                 self.pty_tx.0.send(Msg::Resize(new_size.into())).ok();
 
@@ -704,6 +739,11 @@ impl Terminal {
             InternalEvent::SetSelection(selection) => {
                 term.selection = selection.as_ref().map(|(sel, _)| sel.clone());
 
+                #[cfg(target_os = "linux")]
+                if let Some(selection_text) = term.selection_to_string() {
+                    cx.write_to_primary(ClipboardItem::new(selection_text));
+                }
+
                 if let Some((_, head)) = selection {
                     self.selection_head = Some(*head);
                 }
@@ -719,6 +759,11 @@ impl Terminal {
 
                     selection.update(point, side);
                     term.selection = Some(selection);
+
+                    #[cfg(target_os = "linux")]
+                    if let Some(selection_text) = term.selection_to_string() {
+                        cx.write_to_primary(ClipboardItem::new(selection_text));
+                    }
 
                     self.selection_head = Some(point);
                     cx.emit(Event::SelectionsChanged)
@@ -795,11 +840,11 @@ impl Terminal {
                         Some(url_match) => {
                             // `]` is a valid symbol in the `file://` URL, so the regex match will include it
                             // consider that when ensuring that the URL match is the same as the original word
-                            if sanitized_match != original_match {
+                            if sanitized_match == original_match {
+                                url_match == sanitized_match
+                            } else {
                                 url_match.start() == sanitized_match.start()
                                     && url_match.end() == original_match.end()
-                            } else {
-                                url_match == sanitized_match
                             }
                         }
                         None => false,
@@ -901,7 +946,7 @@ impl Terminal {
         }
     }
 
-    pub fn select_matches(&mut self, matches: Vec<RangeInclusive<AlacPoint>>) {
+    pub fn select_matches(&mut self, matches: &[RangeInclusive<AlacPoint>]) {
         let matches_to_select = self
             .matches
             .iter()
@@ -939,7 +984,9 @@ impl Terminal {
 
     ///Resize the terminal and the PTY.
     pub fn set_size(&mut self, new_size: TerminalSize) {
-        self.events.push_back(InternalEvent::Resize(new_size))
+        if self.last_content.size != new_size {
+            self.events.push_back(InternalEvent::Resize(new_size))
+        }
     }
 
     ///Write the Input payload to the tty.
@@ -978,11 +1025,11 @@ impl Terminal {
     }
 
     pub fn try_modifiers_change(&mut self, modifiers: &Modifiers) -> bool {
-        let changed = self.cmd_pressed != modifiers.command;
-        if !self.cmd_pressed && modifiers.command {
+        let changed = self.secondary_pressed != modifiers.secondary();
+        if !self.secondary_pressed && modifiers.secondary() {
             self.refresh_hovered_word();
         }
-        self.cmd_pressed = modifiers.command;
+        self.secondary_pressed = modifiers.secondary();
         changed
     }
 
@@ -1085,7 +1132,7 @@ impl Terminal {
                     self.pty_tx.notify(bytes);
                 }
             }
-        } else if self.cmd_pressed {
+        } else if self.secondary_pressed {
             self.word_from_position(Some(position));
         }
     }
@@ -1144,7 +1191,12 @@ impl Terminal {
         Some(scroll_delta)
     }
 
-    pub fn mouse_down(&mut self, e: &MouseDownEvent, origin: Point<Pixels>) {
+    pub fn mouse_down(
+        &mut self,
+        e: &MouseDownEvent,
+        origin: Point<Pixels>,
+        cx: &mut ModelContext<Self>,
+    ) {
         let position = e.position - origin;
         let point = grid_point(
             position,
@@ -1181,6 +1233,11 @@ impl Terminal {
                 self.events
                     .push_back(InternalEvent::SetSelection(Some((sel, point))));
             }
+        } else if e.button == MouseButton::Middle {
+            if let Some(item) = cx.read_from_primary() {
+                let text = item.text().to_string();
+                self.input(text);
+            }
         }
     }
 
@@ -1215,7 +1272,7 @@ impl Terminal {
                 let mouse_cell_index = content_index_for_mouse(position, &self.last_content.size);
                 if let Some(link) = self.last_content.cells[mouse_cell_index].hyperlink() {
                     cx.open_url(link.uri());
-                } else if self.cmd_pressed {
+                } else if self.secondary_pressed {
                     self.events
                         .push_back(InternalEvent::FindHyperlink(position, true));
                 }
@@ -1238,8 +1295,7 @@ impl Terminal {
                     self.last_content.display_offset,
                 );
 
-                if let Some(scrolls) =
-                    scroll_report(point, scroll_lines as i32, e, self.last_content.mode)
+                if let Some(scrolls) = scroll_report(point, scroll_lines, e, self.last_content.mode)
                 {
                     for scroll in scrolls {
                         self.pty_tx.notify(scroll);
@@ -1307,38 +1363,159 @@ impl Terminal {
     }
 
     pub fn title(&self, truncate: bool) -> String {
-        self.foreground_process_info
-            .as_ref()
-            .map(|fpi| {
-                let process_file = fpi
-                    .cwd
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let process_name = format!(
-                    "{}{}",
-                    fpi.name,
-                    if fpi.argv.len() >= 1 {
-                        format!(" {}", (fpi.argv[1..]).join(" "))
-                    } else {
-                        "".to_string()
-                    }
-                );
-                let (process_file, process_name) = if truncate {
-                    (
-                        truncate_and_trailoff(&process_file, 25),
-                        truncate_and_trailoff(&process_name, 25),
-                    )
+        const MAX_CHARS: usize = 25;
+        match &self.task {
+            Some(task_state) => {
+                if truncate {
+                    truncate_and_trailoff(&task_state.label, MAX_CHARS)
                 } else {
-                    (process_file, process_name)
-                };
-                format!("{process_file} — {process_name}")
-            })
-            .unwrap_or_else(|| "Terminal".to_string())
+                    task_state.full_label.clone()
+                }
+            }
+            None => self
+                .pty_info
+                .current
+                .as_ref()
+                .map(|fpi| {
+                    let process_file = fpi
+                        .cwd
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_default();
+
+                    let argv = fpi.argv.clone();
+                    let process_name = format!(
+                        "{}{}",
+                        fpi.name,
+                        if argv.len() >= 1 {
+                            format!(" {}", (argv[1..]).join(" "))
+                        } else {
+                            "".to_string()
+                        }
+                    );
+                    let (process_file, process_name) = if truncate {
+                        (
+                            truncate_and_trailoff(&process_file, MAX_CHARS),
+                            truncate_and_trailoff(&process_name, MAX_CHARS),
+                        )
+                    } else {
+                        (process_file, process_name)
+                    };
+                    format!("{process_file} — {process_name}")
+                })
+                .unwrap_or_else(|| "Terminal".to_string()),
+        }
     }
 
     pub fn can_navigate_to_selected_word(&self) -> bool {
-        self.cmd_pressed && self.hovered_word
+        self.secondary_pressed && self.hovered_word
+    }
+
+    pub fn task(&self) -> Option<&TaskState> {
+        self.task.as_ref()
+    }
+
+    pub fn wait_for_completed_task(&self, cx: &mut AppContext) -> Task<()> {
+        if let Some(task) = self.task() {
+            if task.status == TaskStatus::Running {
+                let mut completion_receiver = task.completion_rx.clone();
+                return cx.spawn(|_| async move {
+                    completion_receiver.next().await;
+                });
+            }
+        }
+        Task::ready(())
+    }
+
+    fn register_task_finished(
+        &mut self,
+        error_code: Option<i32>,
+        cx: &mut ModelContext<'_, Terminal>,
+    ) {
+        self.completion_tx.try_send(()).ok();
+        let task = match &mut self.task {
+            Some(task) => task,
+            None => {
+                if error_code.is_none() {
+                    cx.emit(Event::CloseTerminal);
+                }
+                return;
+            }
+        };
+        if task.status != TaskStatus::Running {
+            return;
+        }
+        match error_code {
+            Some(error_code) => {
+                task.status.register_task_exit(error_code);
+            }
+            None => {
+                task.status.register_terminal_exit();
+            }
+        };
+
+        let (task_line, command_line) = task_summary(task, error_code);
+        // SAFETY: the invocation happens on non `TaskStatus::Running` tasks, once,
+        // after either `AlacTermEvent::Exit` or `AlacTermEvent::ChildExit` events that are spawned
+        // when Zed task finishes and no more output is made.
+        // After the task summary is output once, no more text is appended to the terminal.
+        unsafe { append_text_to_term(&mut self.term.lock(), &[&task_line, &command_line]) };
+    }
+}
+
+const TASK_DELIMITER: &str = "⏵ ";
+fn task_summary(task: &TaskState, error_code: Option<i32>) -> (String, String) {
+    let escaped_full_label = task.full_label.replace("\r\n", "\r").replace('\n', "\r");
+    let task_line = match error_code {
+        Some(0) => {
+            format!("{TASK_DELIMITER}Task `{escaped_full_label}` finished successfully")
+        }
+        Some(error_code) => {
+            format!("{TASK_DELIMITER}Task `{escaped_full_label}` finished with non-zero error code: {error_code}")
+        }
+        None => {
+            format!("{TASK_DELIMITER}Task `{escaped_full_label}` finished")
+        }
+    };
+    let escaped_command_label = task.command_label.replace("\r\n", "\r").replace('\n', "\r");
+    let command_line = format!("{TASK_DELIMITER}Command: '{escaped_command_label}'");
+    (task_line, command_line)
+}
+
+/// Appends a stringified task summary to the terminal, after its output.
+///
+/// SAFETY: This function should only be called after terminal's PTY is no longer alive.
+/// New text being added to the terminal here, uses "less public" APIs,
+/// which are not maintaining the entire terminal state intact.
+///
+///
+/// The library
+///
+/// * does not increment inner grid cursor's _lines_ on `input` calls
+/// (but displaying the lines correctly and incrementing cursor's columns)
+///
+/// * ignores `\n` and \r` character input, requiring the `newline` call instead
+///
+/// * does not alter grid state after `newline` call
+/// so its `bottommost_line` is always the same additions, and
+/// the cursor's `point` is not updated to the new line and column values
+///
+/// * ??? there could be more consequences, and any further "proper" streaming from the PTY might bug and/or panic.
+/// Still, concequent `append_text_to_term` invocations are possible and display the contents correctly.
+///
+/// Despite the quirks, this is the simplest approach to appending text to the terminal: its alternative, `grid_mut` manipulations,
+/// do not properly set the scrolling state and display odd text after appending; also those manipulations are more tedious and error-prone.
+/// The function achieves proper display and scrolling capabilities, at a cost of grid state not properly synchronized.
+/// This is enough for printing moderately-sized texts like task summaries, but might break or perform poorly for larger texts.
+unsafe fn append_text_to_term(term: &mut Term<ZedListener>, text_lines: &[&str]) {
+    term.newline();
+    term.grid_mut().cursor.point.column = Column(0);
+    for line in text_lines {
+        for c in line.chars() {
+            term.input(c);
+        }
+        term.newline();
+        term.grid_mut().cursor.point.column = Column(0);
     }
 }
 
@@ -1397,7 +1574,7 @@ fn content_index_for_mouse(pos: Point<Pixels>, size: &TerminalSize) -> usize {
     clamped_row * size.columns() + clamped_col
 }
 
-/// Converts an 8 bit ANSI color to it's GPUI equivalent.
+/// Converts an 8 bit ANSI color to its GPUI equivalent.
 /// Accepts `usize` for compatibility with the `alacritty::Colors` interface,
 /// Other than that use case, should only be called with values in the [0,255] range
 pub fn get_color_at_index(index: usize, theme: &Theme) -> Hsla {
@@ -1423,7 +1600,7 @@ pub fn get_color_at_index(index: usize, theme: &Theme) -> Hsla {
         15 => colors.terminal_ansi_bright_white,
         // 16-231 are mapped to their RGB colors on a 0-5 range per channel
         16..=231 => {
-            let (r, g, b) = rgb_for_index(&(index as u8)); // Split the index into it's ANSI-RGB components
+            let (r, g, b) = rgb_for_index(index as u8); // Split the index into its ANSI-RGB components
             let step = (u8::MAX as f32 / 5.).floor() as u8; // Split the RGB range into 5 chunks, with floor so no overflow
             rgba_color(r * step, g * step, b * step) // Map the ANSI-RGB components to an RGB color
         }
@@ -1462,8 +1639,8 @@ pub fn get_color_at_index(index: usize, theme: &Theme) -> Hsla {
 /// ```
 ///
 /// This function does the reverse, calculating the `r`, `g`, and `b` components from a given index.
-fn rgb_for_index(i: &u8) -> (u8, u8, u8) {
-    debug_assert!((&16..=&231).contains(&i));
+fn rgb_for_index(i: u8) -> (u8, u8, u8) {
+    debug_assert!((16..=231).contains(&i));
     let i = i - 16;
     let r = (i - (i % 36)) / 36;
     let g = ((i % 36) - (i % 6)) / 6;
@@ -1473,9 +1650,9 @@ fn rgb_for_index(i: &u8) -> (u8, u8, u8) {
 
 pub fn rgba_color(r: u8, g: u8, b: u8) -> Hsla {
     Rgba {
-        r: (r as f32 / 255.) as f32,
-        g: (g as f32 / 255.) as f32,
-        b: (b as f32 / 255.) as f32,
+        r: (r as f32 / 255.),
+        g: (g as f32 / 255.),
+        b: (b as f32 / 255.),
         a: 1.,
     }
     .into()
@@ -1496,9 +1673,9 @@ mod tests {
 
     #[test]
     fn test_rgb_for_index() {
-        //Test every possible value in the color cube
+        // Test every possible value in the color cube.
         for i in 16..=231 {
-            let (r, g, b) = rgb_for_index(&(i as u8));
+            let (r, g, b) = rgb_for_index(i);
             assert_eq!(i, 16 + 36 * r + 6 * g + b);
         }
     }
@@ -1564,7 +1741,7 @@ mod tests {
         assert_eq!(
             content.cells[content_index_for_mouse(
                 point(Pixels::from(-10.), Pixels::from(-10.)),
-                &content.size
+                &content.size,
             )]
             .c,
             cells[0][0]
@@ -1572,7 +1749,7 @@ mod tests {
         assert_eq!(
             content.cells[content_index_for_mouse(
                 point(Pixels::from(1000.), Pixels::from(1000.)),
-                &content.size
+                &content.size,
             )]
             .c,
             cells[9][9]
@@ -1582,9 +1759,9 @@ mod tests {
     fn get_cells(size: TerminalSize, rng: &mut ThreadRng) -> Vec<Vec<char>> {
         let mut cells = Vec::new();
 
-        for _ in 0..(f32::from(size.height() / size.line_height()) as usize) {
+        for _ in 0..((size.height() / size.line_height()) as usize) {
             let mut row_vec = Vec::new();
-            for _ in 0..(f32::from(size.width() / size.cell_width()) as usize) {
+            for _ in 0..((size.width() / size.cell_width()) as usize) {
                 let cell_char = rng.sample(Alphanumeric) as char;
                 row_vec.push(cell_char)
             }

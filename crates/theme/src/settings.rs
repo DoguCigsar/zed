@@ -4,7 +4,7 @@ use anyhow::Result;
 use derive_more::{Deref, DerefMut};
 use gpui::{
     px, AppContext, Font, FontFeatures, FontStyle, FontWeight, Global, Pixels, Subscription,
-    ViewContext, WindowContext,
+    ViewContext,
 };
 use refineable::Refineable;
 use schemars::{
@@ -14,12 +14,71 @@ use schemars::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use settings::{Settings, SettingsJsonSchemaParams};
+use settings::{Settings, SettingsJsonSchemaParams, SettingsSources};
 use std::sync::Arc;
 use util::ResultExt as _;
 
 const MIN_FONT_SIZE: Pixels = px(6.0);
 const MIN_LINE_HEIGHT: f32 = 1.0;
+
+#[derive(
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UiDensity {
+    /// A denser UI with tighter spacing and smaller elements.
+    #[serde(alias = "compact")]
+    Compact,
+    #[default]
+    #[serde(alias = "default")]
+    /// The default UI density.
+    Default,
+    #[serde(alias = "comfortable")]
+    /// A looser UI with more spacing and larger elements.
+    Comfortable,
+}
+
+impl UiDensity {
+    pub fn spacing_ratio(self) -> f32 {
+        match self {
+            UiDensity::Compact => 0.75,
+            UiDensity::Default => 1.0,
+            UiDensity::Comfortable => 1.25,
+        }
+    }
+}
+
+impl From<String> for UiDensity {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "compact" => Self::Compact,
+            "default" => Self::Default,
+            "comfortable" => Self::Comfortable,
+            _ => Self::default(),
+        }
+    }
+}
+
+impl Into<String> for UiDensity {
+    fn into(self) -> String {
+        match self {
+            UiDensity::Compact => "compact".to_string(),
+            UiDensity::Default => "default".to_string(),
+            UiDensity::Comfortable => "comfortable".to_string(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ThemeSettings {
@@ -31,6 +90,36 @@ pub struct ThemeSettings {
     pub theme_selection: Option<ThemeSelection>,
     pub active_theme: Arc<Theme>,
     pub theme_overrides: Option<ThemeStyleContent>,
+    pub ui_density: UiDensity,
+}
+
+impl ThemeSettings {
+    /// Reloads the current theme.
+    ///
+    /// Reads the [`ThemeSettings`] to know which theme should be loaded,
+    /// taking into account the current [`SystemAppearance`].
+    pub fn reload_current_theme(cx: &mut AppContext) {
+        let mut theme_settings = ThemeSettings::get_global(cx).clone();
+        let system_appearance = SystemAppearance::global(cx);
+
+        if let Some(theme_selection) = theme_settings.theme_selection.clone() {
+            let mut theme_name = theme_selection.theme(*system_appearance);
+
+            // If the selected theme doesn't exist, fall back to a default theme
+            // based on the system appearance.
+            let theme_registry = ThemeRegistry::global(cx);
+            if theme_registry.get(theme_name).ok().is_none() {
+                theme_name = match *system_appearance {
+                    Appearance::Light => "One Light",
+                    Appearance::Dark => "One Dark",
+                };
+            };
+
+            if let Some(_theme) = theme_settings.switch_theme(theme_name, cx) {
+                ThemeSettings::override_global(theme_settings, cx);
+            }
+        }
+    }
 }
 
 /// The appearance of the system.
@@ -49,17 +138,17 @@ struct GlobalSystemAppearance(SystemAppearance);
 impl Global for GlobalSystemAppearance {}
 
 impl SystemAppearance {
+    /// Initializes the [`SystemAppearance`] for the application.
+    pub fn init(cx: &mut AppContext) {
+        *cx.default_global::<GlobalSystemAppearance>() =
+            GlobalSystemAppearance(SystemAppearance(cx.window_appearance().into()));
+    }
+
     /// Returns the global [`SystemAppearance`].
     ///
     /// Inserts a default [`SystemAppearance`] if one does not yet exist.
     pub(crate) fn default_global(cx: &mut AppContext) -> Self {
         cx.default_global::<GlobalSystemAppearance>().0
-    }
-
-    /// Initializes the [`SystemAppearance`] for the current window.
-    pub fn init_for_window(cx: &mut WindowContext) {
-        *cx.default_global::<GlobalSystemAppearance>() =
-            GlobalSystemAppearance(SystemAppearance(cx.appearance().into()));
     }
 
     /// Returns the global [`SystemAppearance`].
@@ -126,24 +215,39 @@ impl ThemeSelection {
     }
 }
 
+/// Settings for rendering text in UI and text buffers.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ThemeSettingsContent {
+    /// The default font size for text in the UI.
     #[serde(default)]
     pub ui_font_size: Option<f32>,
+    /// The name of a font to use for rendering in the UI.
     #[serde(default)]
     pub ui_font_family: Option<String>,
+    /// The OpenType features to enable for text in the UI.
     #[serde(default)]
     pub ui_font_features: Option<FontFeatures>,
+    /// The name of a font to use for rendering in text buffers.
     #[serde(default)]
     pub buffer_font_family: Option<String>,
+    /// The default font size for rendering in text buffers.
     #[serde(default)]
     pub buffer_font_size: Option<f32>,
+    /// The buffer's line height.
     #[serde(default)]
     pub buffer_line_height: Option<BufferLineHeight>,
+    /// The OpenType features to enable for rendering in text buffers.
     #[serde(default)]
     pub buffer_font_features: Option<FontFeatures>,
+    /// The name of the Zed theme to use.
     #[serde(default)]
     pub theme: Option<ThemeSelection>,
+
+    /// UNSTABLE: Expect many elements to be broken.
+    ///
+    // Controls the density of the UI.
+    #[serde(rename = "unstable.ui_density", default)]
+    pub ui_density: Option<UiDensity>,
 
     /// EXPERIMENTAL: Overrides for the current theme.
     ///
@@ -191,7 +295,7 @@ impl ThemeSettings {
 
         let mut new_theme = None;
 
-        if let Some(theme) = themes.get(&theme).log_err() {
+        if let Some(theme) = themes.get(theme).log_err() {
             self.active_theme = theme.clone();
             new_theme = Some(theme);
         }
@@ -206,6 +310,12 @@ impl ThemeSettings {
         if let Some(theme_overrides) = &self.theme_overrides {
             let mut base_theme = (*self.active_theme).clone();
 
+            if let Some(window_background_appearance) = theme_overrides.window_background_appearance
+            {
+                base_theme.styles.window_background_appearance =
+                    window_background_appearance.into();
+            }
+
             base_theme
                 .styles
                 .colors
@@ -214,6 +324,7 @@ impl ThemeSettings {
                 .styles
                 .status
                 .refine(&theme_overrides.status_colors_refinement());
+            base_theme.styles.player.merge(&theme_overrides.players);
             base_theme.styles.syntax = Arc::new(SyntaxTheme {
                 highlights: {
                     let mut highlights = base_theme.styles.syntax.highlights.clone();
@@ -271,14 +382,11 @@ impl settings::Settings for ThemeSettings {
 
     type FileContent = ThemeSettingsContent;
 
-    fn load(
-        defaults: &Self::FileContent,
-        user_values: &[&Self::FileContent],
-        cx: &mut AppContext,
-    ) -> Result<Self> {
+    fn load(sources: SettingsSources<Self::FileContent>, cx: &mut AppContext) -> Result<Self> {
         let themes = ThemeRegistry::default_global(cx);
         let system_appearance = SystemAppearance::default_global(cx);
 
+        let defaults = sources.default;
         let mut this = Self {
             ui_font_size: defaults.ui_font_size.unwrap().into(),
             ui_font: Font {
@@ -301,20 +409,25 @@ impl settings::Settings for ThemeSettings {
                 .or(themes.get(&one_dark().name))
                 .unwrap(),
             theme_overrides: None,
+            ui_density: defaults.ui_density.unwrap_or(UiDensity::Default),
         };
 
-        for value in user_values.into_iter().copied().cloned() {
-            if let Some(value) = value.buffer_font_family {
+        for value in sources.user.into_iter().chain(sources.release_channel) {
+            if let Some(value) = value.ui_density {
+                this.ui_density = value;
+            }
+
+            if let Some(value) = value.buffer_font_family.clone() {
                 this.buffer_font.family = value.into();
             }
-            if let Some(value) = value.buffer_font_features {
+            if let Some(value) = value.buffer_font_features.clone() {
                 this.buffer_font.features = value;
             }
 
-            if let Some(value) = value.ui_font_family {
+            if let Some(value) = value.ui_font_family.clone() {
                 this.ui_font.family = value.into();
             }
-            if let Some(value) = value.ui_font_features {
+            if let Some(value) = value.ui_font_features.clone() {
                 this.ui_font.features = value;
             }
 
@@ -328,7 +441,7 @@ impl settings::Settings for ThemeSettings {
                 }
             }
 
-            this.theme_overrides = value.theme_overrides;
+            this.theme_overrides.clone_from(&value.theme_overrides);
             this.apply_theme_overrides();
 
             merge(&mut this.ui_font_size, value.ui_font_size.map(Into::into));

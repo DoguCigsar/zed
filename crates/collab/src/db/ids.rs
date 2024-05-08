@@ -67,29 +67,35 @@ macro_rules! id_type {
     };
 }
 
-id_type!(BufferId);
 id_type!(AccessTokenId);
+id_type!(BufferId);
+id_type!(ChannelBufferCollaboratorId);
 id_type!(ChannelChatParticipantId);
 id_type!(ChannelId);
 id_type!(ChannelMemberId);
-id_type!(MessageId);
 id_type!(ContactId);
+id_type!(DevServerId);
+id_type!(ExtensionId);
+id_type!(FlagId);
 id_type!(FollowerId);
+id_type!(HostedProjectId);
+id_type!(MessageId);
+id_type!(NotificationId);
+id_type!(NotificationKindId);
+id_type!(ProjectCollaboratorId);
+id_type!(ProjectId);
+id_type!(DevServerProjectId);
+id_type!(ReplicaId);
 id_type!(RoomId);
 id_type!(RoomParticipantId);
-id_type!(ProjectId);
-id_type!(ProjectCollaboratorId);
-id_type!(ReplicaId);
 id_type!(ServerId);
 id_type!(SignupId);
 id_type!(UserId);
-id_type!(ChannelBufferCollaboratorId);
-id_type!(FlagId);
-id_type!(NotificationId);
-id_type!(NotificationKindId);
 
 /// ChannelRole gives you permissions for both channels and calls.
-#[derive(Eq, PartialEq, Copy, Clone, Debug, EnumIter, DeriveActiveEnum, Default, Hash)]
+#[derive(
+    Eq, PartialEq, Copy, Clone, Debug, EnumIter, DeriveActiveEnum, Default, Hash, Serialize,
+)]
 #[sea_orm(rs_type = "String", db_type = "String(None)")]
 pub enum ChannelRole {
     /// Admin can read/write and change permissions.
@@ -99,8 +105,12 @@ pub enum ChannelRole {
     #[sea_orm(string_value = "member")]
     #[default]
     Member,
+    /// Talker can read, but not write.
+    /// They can use microphones and the channel chat
+    #[sea_orm(string_value = "talker")]
+    Talker,
     /// Guest can read, but not write.
-    /// (thought they can use the channel chat)
+    /// They can not use microphones but can use the chat.
     #[sea_orm(string_value = "guest")]
     Guest,
     /// Banned may not read.
@@ -113,8 +123,9 @@ impl ChannelRole {
     pub fn should_override(&self, other: Self) -> bool {
         use ChannelRole::*;
         match self {
-            Admin => matches!(other, Member | Banned | Guest),
-            Member => matches!(other, Banned | Guest),
+            Admin => matches!(other, Member | Banned | Talker | Guest),
+            Member => matches!(other, Banned | Talker | Guest),
+            Talker => matches!(other, Guest),
             Banned => matches!(other, Guest),
             Guest => false,
         }
@@ -133,7 +144,7 @@ impl ChannelRole {
         use ChannelRole::*;
         match self {
             Admin | Member => true,
-            Guest => visibility == ChannelVisibility::Public,
+            Guest | Talker => visibility == ChannelVisibility::Public,
             Banned => false,
         }
     }
@@ -143,7 +154,7 @@ impl ChannelRole {
         use ChannelRole::*;
         match self {
             Admin | Member => true,
-            Guest | Banned => false,
+            Guest | Talker | Banned => false,
         }
     }
 
@@ -151,16 +162,16 @@ impl ChannelRole {
     pub fn can_only_see_public_descendants(&self) -> bool {
         use ChannelRole::*;
         match self {
-            Guest => true,
+            Guest | Talker => true,
             Admin | Member | Banned => false,
         }
     }
 
     /// True if the role can share screen/microphone/projects into rooms.
-    pub fn can_publish_to_rooms(&self) -> bool {
+    pub fn can_use_microphone(&self) -> bool {
         use ChannelRole::*;
         match self {
-            Admin | Member => true,
+            Admin | Member | Talker => true,
             Guest | Banned => false,
         }
     }
@@ -170,7 +181,7 @@ impl ChannelRole {
         use ChannelRole::*;
         match self {
             Admin | Member => true,
-            Guest | Banned => false,
+            Talker | Guest | Banned => false,
         }
     }
 
@@ -178,7 +189,7 @@ impl ChannelRole {
     pub fn can_read_projects(&self) -> bool {
         use ChannelRole::*;
         match self {
-            Admin | Member | Guest => true,
+            Admin | Member | Guest | Talker => true,
             Banned => false,
         }
     }
@@ -187,7 +198,7 @@ impl ChannelRole {
         use ChannelRole::*;
         match self {
             Admin | Member => true,
-            Banned | Guest => false,
+            Banned | Guest | Talker => false,
         }
     }
 }
@@ -197,6 +208,7 @@ impl From<proto::ChannelRole> for ChannelRole {
         match value {
             proto::ChannelRole::Admin => ChannelRole::Admin,
             proto::ChannelRole::Member => ChannelRole::Member,
+            proto::ChannelRole::Talker => ChannelRole::Talker,
             proto::ChannelRole::Guest => ChannelRole::Guest,
             proto::ChannelRole::Banned => ChannelRole::Banned,
         }
@@ -208,6 +220,7 @@ impl Into<proto::ChannelRole> for ChannelRole {
         match self {
             ChannelRole::Admin => proto::ChannelRole::Admin,
             ChannelRole::Member => proto::ChannelRole::Member,
+            ChannelRole::Talker => proto::ChannelRole::Talker,
             ChannelRole::Guest => proto::ChannelRole::Guest,
             ChannelRole::Banned => proto::ChannelRole::Banned,
         }
@@ -257,4 +270,19 @@ impl Into<i32> for ChannelVisibility {
         let proto: proto::ChannelVisibility = self.into();
         proto.into()
     }
+}
+
+#[derive(Copy, Clone, Debug, Serialize, PartialEq)]
+pub enum PrincipalId {
+    UserId(UserId),
+    DevServerId(DevServerId),
+}
+
+/// Indicate whether a [Buffer] has permissions to edit.
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum Capability {
+    /// The buffer is a mutable replica.
+    ReadWrite,
+    /// The buffer is a read-only replica.
+    ReadOnly,
 }

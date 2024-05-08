@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::{ops::Range, path::PathBuf};
 
 use crate::{HighlightId, Language, LanguageRegistry};
-use gpui::{px, FontStyle, FontWeight, HighlightStyle, UnderlineStyle};
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
+use gpui::{px, FontStyle, FontWeight, HighlightStyle, StrikethroughStyle, UnderlineStyle};
+use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 
 /// Parsed Markdown content.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ParsedMarkdown {
     /// The Markdown text.
     pub text: String,
@@ -47,6 +47,13 @@ impl MarkdownHighlight {
                     });
                 }
 
+                if style.strikethrough {
+                    highlight.strikethrough = Some(StrikethroughStyle {
+                        thickness: px(1.),
+                        ..Default::default()
+                    });
+                }
+
                 if style.weight != FontWeight::default() {
                     highlight.font_weight = Some(style.weight);
                 }
@@ -66,6 +73,8 @@ pub struct MarkdownHighlightStyle {
     pub italic: bool,
     /// Whether the text should be underlined.
     pub underline: bool,
+    /// Whether the text should be struck through.
+    pub strikethrough: bool,
     /// The weight of the text.
     pub weight: FontWeight,
 }
@@ -151,11 +160,15 @@ pub async fn parse_markdown_block(
 ) {
     let mut bold_depth = 0;
     let mut italic_depth = 0;
+    let mut strikethrough_depth = 0;
     let mut link_url = None;
     let mut current_language = None;
     let mut list_stack = Vec::new();
 
-    for event in Parser::new_ext(markdown, Options::all()) {
+    let mut options = pulldown_cmark::Options::all();
+    options.remove(pulldown_cmark::Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+
+    for event in Parser::new_ext(markdown, options) {
         let prev_len = text.len();
         match event {
             Event::Text(t) => {
@@ -172,6 +185,10 @@ pub async fn parse_markdown_block(
 
                     if italic_depth > 0 {
                         style.italic = true;
+                    }
+
+                    if strikethrough_depth > 0 {
+                        style.strikethrough = true;
                     }
 
                     if let Some(link) = link_url.clone().and_then(|u| Link::identify(u)) {
@@ -221,7 +238,12 @@ pub async fn parse_markdown_block(
             Event::Start(tag) => match tag {
                 Tag::Paragraph => new_paragraph(text, &mut list_stack),
 
-                Tag::Heading(_, _, _) => {
+                Tag::Heading {
+                    level: _,
+                    id: _,
+                    classes: _,
+                    attrs: _,
+                } => {
                     new_paragraph(text, &mut list_stack);
                     bold_depth += 1;
                 }
@@ -230,7 +252,7 @@ pub async fn parse_markdown_block(
                     new_paragraph(text, &mut list_stack);
                     current_language = if let CodeBlockKind::Fenced(language) = kind {
                         language_registry
-                            .language_for_name(language.as_ref())
+                            .language_for_name_or_extension(language.as_ref())
                             .await
                             .ok()
                     } else {
@@ -242,7 +264,14 @@ pub async fn parse_markdown_block(
 
                 Tag::Strong => bold_depth += 1,
 
-                Tag::Link(_, url, _) => link_url = Some(url.to_string()),
+                Tag::Strikethrough => strikethrough_depth += 1,
+
+                Tag::Link {
+                    link_type: _,
+                    dest_url,
+                    title: _,
+                    id: _,
+                } => link_url = Some(dest_url.to_string()),
 
                 Tag::List(number) => {
                     list_stack.push((number, false));
@@ -272,12 +301,13 @@ pub async fn parse_markdown_block(
             },
 
             Event::End(tag) => match tag {
-                Tag::Heading(_, _, _) => bold_depth -= 1,
-                Tag::CodeBlock(_) => current_language = None,
-                Tag::Emphasis => italic_depth -= 1,
-                Tag::Strong => bold_depth -= 1,
-                Tag::Link(_, _, _) => link_url = None,
-                Tag::List(_) => drop(list_stack.pop()),
+                TagEnd::Heading(_) => bold_depth -= 1,
+                TagEnd::CodeBlock => current_language = None,
+                TagEnd::Emphasis => italic_depth -= 1,
+                TagEnd::Strong => bold_depth -= 1,
+                TagEnd::Strikethrough => strikethrough_depth -= 1,
+                TagEnd::Link => link_url = None,
+                TagEnd::List(_) => drop(list_stack.pop()),
                 _ => {}
             },
 
@@ -328,5 +358,37 @@ pub fn new_paragraph(text: &mut String, list_stack: &mut Vec<(Option<u64>, bool)
     }
     if is_subsequent_paragraph_of_list {
         text.push_str("  ");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn test_dividers() {
+        let input = r#"
+### instance-method `format`
+
+---
+→ `void`
+Parameters:
+- `const int &`
+- `const std::tm &`
+- `int & dest`
+
+---
+```cpp
+// In my_formatter_flag
+public: void format(const int &, const std::tm &, int &dest)
+```
+"#;
+
+        let mut options = pulldown_cmark::Options::all();
+        options.remove(pulldown_cmark::Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+
+        let parser = pulldown_cmark::Parser::new_ext(input, options);
+        for event in parser.into_iter() {
+            println!("{:?}", event);
+        }
     }
 }

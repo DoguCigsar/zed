@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use audio::{Audio, Sound};
 use client::{
     proto::{self, PeerId},
-    Client, ParticipantIndex, TypedEnvelope, User, UserStore,
+    ChannelId, Client, ParticipantIndex, TypedEnvelope, User, UserStore,
 };
 use collections::{BTreeMap, HashMap, HashSet};
 use fs::Fs;
@@ -27,7 +27,7 @@ pub const RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     RoomJoined {
-        channel_id: Option<u64>,
+        channel_id: Option<ChannelId>,
     },
     ParticipantLocationChanged {
         participant_id: proto::PeerId,
@@ -52,14 +52,14 @@ pub enum Event {
     RemoteProjectInvitationDiscarded {
         project_id: u64,
     },
-    Left {
-        channel_id: Option<u64>,
+    RoomLeft {
+        channel_id: Option<ChannelId>,
     },
 }
 
 pub struct Room {
     id: u64,
-    channel_id: Option<u64>,
+    channel_id: Option<ChannelId>,
     live_kit: Option<LiveKitRoom>,
     status: RoomStatus,
     shared_projects: HashSet<WeakModel<Project>>,
@@ -84,7 +84,7 @@ pub struct Room {
 impl EventEmitter<Event> for Room {}
 
 impl Room {
-    pub fn channel_id(&self) -> Option<u64> {
+    pub fn channel_id(&self) -> Option<ChannelId> {
         self.channel_id
     }
 
@@ -106,7 +106,7 @@ impl Room {
 
     fn new(
         id: u64,
-        channel_id: Option<u64>,
+        channel_id: Option<ChannelId>,
         live_kit_connection_info: Option<proto::LiveKitConnectionInfo>,
         client: Arc<Client>,
         user_store: Model<UserStore>,
@@ -156,7 +156,7 @@ impl Room {
             cx.spawn(|this, mut cx| async move {
                 connect.await?;
                 this.update(&mut cx, |this, cx| {
-                    if !this.read_only() {
+                    if this.can_use_microphone() {
                         if let Some(live_kit) = &this.live_kit {
                             if !live_kit.muted_by_user && !live_kit.deafened {
                                 return this.share_microphone(cx);
@@ -273,13 +273,17 @@ impl Room {
     }
 
     pub(crate) async fn join_channel(
-        channel_id: u64,
+        channel_id: ChannelId,
         client: Arc<Client>,
         user_store: Model<UserStore>,
         cx: AsyncAppContext,
     ) -> Result<Model<Self>> {
         Self::from_join_response(
-            client.request(proto::JoinChannel { channel_id }).await?,
+            client
+                .request(proto::JoinChannel {
+                    channel_id: channel_id.0,
+                })
+                .await?,
             client,
             user_store,
             cx,
@@ -337,7 +341,7 @@ impl Room {
         let room = cx.new_model(|cx| {
             Self::new(
                 room_proto.id,
-                response.channel_id,
+                response.channel_id.map(ChannelId),
                 response.live_kit_connection_info,
                 client,
                 user_store,
@@ -362,9 +366,6 @@ impl Room {
 
     pub(crate) fn leave(&mut self, cx: &mut ModelContext<Self>) -> Task<Result<()>> {
         cx.notify();
-        cx.emit(Event::Left {
-            channel_id: self.channel_id(),
-        });
         self.leave_internal(cx)
     }
 
@@ -1178,19 +1179,10 @@ impl Room {
     ) -> Task<Result<Model<Project>>> {
         let client = self.client.clone();
         let user_store = self.user_store.clone();
-        let role = self.local_participant.role;
         cx.emit(Event::RemoteProjectJoined { project_id: id });
         cx.spawn(move |this, mut cx| async move {
-            let project = Project::remote(
-                id,
-                client,
-                user_store,
-                language_registry,
-                fs,
-                role,
-                cx.clone(),
-            )
-            .await?;
+            let project =
+                Project::in_room(id, client, user_store, language_registry, fs, cx.clone()).await?;
 
             this.update(&mut cx, |this, cx| {
                 this.joined_projects.retain(|project| {
@@ -1211,14 +1203,25 @@ impl Room {
         project: Model<Project>,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<u64>> {
-        if let Some(project_id) = project.read(cx).remote_id() {
-            return Task::ready(Ok(project_id));
-        }
+        let request = if let Some(dev_server_project_id) = project.read(cx).dev_server_project_id()
+        {
+            self.client.request(proto::ShareProject {
+                room_id: self.id(),
+                worktrees: vec![],
+                dev_server_project_id: Some(dev_server_project_id.0),
+            })
+        } else {
+            if let Some(project_id) = project.read(cx).remote_id() {
+                return Task::ready(Ok(project_id));
+            }
 
-        let request = self.client.request(proto::ShareProject {
-            room_id: self.id(),
-            worktrees: project.read(cx).worktree_metadata_protos(cx),
-        });
+            self.client.request(proto::ShareProject {
+                room_id: self.id(),
+                worktrees: project.read(cx).worktree_metadata_protos(cx),
+                dev_server_project_id: None,
+            })
+        };
+
         cx.spawn(|this, mut cx| async move {
             let response = request.await?;
 
@@ -1322,11 +1325,6 @@ impl Room {
         })
     }
 
-    pub fn read_only(&self) -> bool {
-        !(self.local_participant().role == proto::ChannelRole::Member
-            || self.local_participant().role == proto::ChannelRole::Admin)
-    }
-
     pub fn is_speaking(&self) -> bool {
         self.live_kit
             .as_ref()
@@ -1335,6 +1333,22 @@ impl Room {
 
     pub fn is_deafened(&self) -> Option<bool> {
         self.live_kit.as_ref().map(|live_kit| live_kit.deafened)
+    }
+
+    pub fn can_use_microphone(&self) -> bool {
+        use proto::ChannelRole::*;
+        match self.local_participant.role {
+            Admin | Member | Talker => true,
+            Guest | Banned => false,
+        }
+    }
+
+    pub fn can_share_projects(&self) -> bool {
+        use proto::ChannelRole::*;
+        match self.local_participant.role {
+            Admin | Member => true,
+            Guest | Banned | Talker => false,
+        }
     }
 
     #[track_caller]

@@ -1,15 +1,34 @@
+// todo(linux): remove
+#![cfg_attr(target_os = "linux", allow(dead_code))]
+// todo(windows): remove
+#![cfg_attr(windows, allow(dead_code))]
+
 mod app_menu;
 mod keystroke;
+
+#[cfg(not(target_os = "macos"))]
+mod cosmic_text;
+
+#[cfg(target_os = "linux")]
+mod linux;
+
 #[cfg(target_os = "macos")]
 mod mac;
+
+#[cfg(any(target_os = "linux", target_os = "windows", feature = "macos-blade"))]
+mod blade;
+
 #[cfg(any(test, feature = "test-support"))]
 mod test;
 
+#[cfg(target_os = "windows")]
+mod windows;
+
 use crate::{
-    Action, AnyWindowHandle, AsyncWindowContext, BackgroundExecutor, Bounds, DevicePixels, Font,
-    FontId, FontMetrics, FontRun, ForegroundExecutor, GlobalPixels, GlyphId, Keymap, LineLayout,
-    Pixels, PlatformInput, Point, RenderGlyphParams, RenderImageParams, RenderSvgParams, Scene,
-    SharedString, Size, Task, TaskLabel, WindowContext,
+    Action, AnyWindowHandle, AsyncWindowContext, BackgroundExecutor, Bounds, DevicePixels,
+    DispatchEventResult, Font, FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, Keymap,
+    LineLayout, Pixels, PlatformInput, Point, RenderGlyphParams, RenderImageParams,
+    RenderSvgParams, Scene, SharedString, Size, Task, TaskLabel, WindowContext,
 };
 use anyhow::Result;
 use async_task::Runnable;
@@ -22,7 +41,6 @@ use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 use std::{
-    any::Any,
     fmt::{self, Debug},
     ops::Range,
     path::{Path, PathBuf},
@@ -33,16 +51,44 @@ use uuid::Uuid;
 
 pub use app_menu::*;
 pub use keystroke::*;
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) use cosmic_text::*;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::*;
 #[cfg(target_os = "macos")]
 pub(crate) use mac::*;
+pub use semantic_version::SemanticVersion;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use test::*;
 use time::UtcOffset;
-pub use util::SemanticVersion;
+#[cfg(target_os = "windows")]
+pub(crate) use windows::*;
 
 #[cfg(target_os = "macos")]
 pub(crate) fn current_platform() -> Rc<dyn Platform> {
     Rc::new(MacPlatform::new())
+}
+#[cfg(target_os = "linux")]
+pub(crate) fn current_platform() -> Rc<dyn Platform> {
+    let wayland_display = std::env::var_os("WAYLAND_DISPLAY");
+    let x11_display = std::env::var_os("DISPLAY");
+
+    let use_wayland = wayland_display.is_some_and(|display| !display.is_empty());
+    let use_x11 = x11_display.is_some_and(|display| !display.is_empty());
+
+    if use_wayland {
+        Rc::new(WaylandClient::new())
+    } else if use_x11 {
+        Rc::new(X11Client::new())
+    } else {
+        Rc::new(HeadlessClient::new())
+    }
+}
+// todo("windows")
+#[cfg(target_os = "windows")]
+pub(crate) fn current_platform() -> Rc<dyn Platform> {
+    Rc::new(WindowsPlatform::new())
 }
 
 pub(crate) trait Platform: 'static {
@@ -52,31 +98,28 @@ pub(crate) trait Platform: 'static {
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>);
     fn quit(&self);
-    fn restart(&self);
+    fn restart(&self, binary_path: Option<PathBuf>);
     fn activate(&self, ignoring_other_apps: bool);
     fn hide(&self);
     fn hide_other_apps(&self);
     fn unhide_other_apps(&self);
 
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>>;
-    fn display(&self, id: DisplayId) -> Option<Rc<dyn PlatformDisplay>>;
+    fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn active_window(&self) -> Option<AnyWindowHandle>;
     fn open_window(
         &self,
         handle: AnyWindowHandle,
-        options: WindowOptions,
+        options: WindowParams,
     ) -> Box<dyn PlatformWindow>;
 
-    fn set_display_link_output_callback(
-        &self,
-        display_id: DisplayId,
-        callback: Box<dyn FnMut() + Send>,
-    );
-    fn start_display_link(&self, display_id: DisplayId);
-    fn stop_display_link(&self, display_id: DisplayId);
+    /// Returns the appearance of the application's windows.
+    fn window_appearance(&self) -> WindowAppearance;
 
     fn open_url(&self, url: &str);
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>);
+    fn register_url_scheme(&self, url: &str) -> Task<Result<()>>;
+
     fn prompt_for_paths(
         &self,
         options: PathPromptOptions,
@@ -84,13 +127,11 @@ pub(crate) trait Platform: 'static {
     fn prompt_for_new_path(&self, directory: &Path) -> oneshot::Receiver<Option<PathBuf>>;
     fn reveal_path(&self, path: &Path);
 
-    fn on_become_active(&self, callback: Box<dyn FnMut()>);
-    fn on_resign_active(&self, callback: Box<dyn FnMut()>);
     fn on_quit(&self, callback: Box<dyn FnMut()>);
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
-    fn on_event(&self, callback: Box<dyn FnMut(PlatformInput) -> bool>);
 
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap);
+    fn add_recent_document(&self, _path: &Path) {}
     fn on_app_menu_action(&self, callback: Box<dyn FnMut(&dyn Action)>);
     fn on_will_open_app_menu(&self, callback: Box<dyn FnMut()>);
     fn on_validate_app_menu_command(&self, callback: Box<dyn FnMut(&dyn Action) -> bool>);
@@ -100,13 +141,14 @@ pub(crate) trait Platform: 'static {
     fn app_version(&self) -> Result<SemanticVersion>;
     fn app_path(&self) -> Result<PathBuf>;
     fn local_timezone(&self) -> UtcOffset;
-    fn double_click_interval(&self) -> Duration;
     fn path_for_auxiliary_executable(&self, name: &str) -> Result<PathBuf>;
 
     fn set_cursor_style(&self, style: CursorStyle);
     fn should_auto_hide_scrollbars(&self) -> bool;
 
+    fn write_to_primary(&self, item: ClipboardItem);
     fn write_to_clipboard(&self, item: ClipboardItem);
+    fn read_from_primary(&self) -> Option<ClipboardItem>;
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>>;
@@ -124,7 +166,7 @@ pub trait PlatformDisplay: Send + Sync + Debug {
     fn uuid(&self) -> Result<Uuid>;
 
     /// Get the bounds for this display
-    fn bounds(&self) -> Bounds<GlobalPixels>;
+    fn bounds(&self) -> Bounds<DevicePixels>;
 }
 
 /// An opaque identifier for a hardware display
@@ -140,15 +182,15 @@ impl Debug for DisplayId {
 unsafe impl Send for DisplayId {}
 
 pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
-    fn bounds(&self) -> WindowBounds;
+    fn bounds(&self) -> Bounds<DevicePixels>;
+    fn is_maximized(&self) -> bool;
+    fn window_bounds(&self) -> WindowBounds;
     fn content_size(&self) -> Size<Pixels>;
     fn scale_factor(&self) -> f32;
-    fn titlebar_height(&self) -> Pixels;
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Rc<dyn PlatformDisplay>;
     fn mouse_position(&self) -> Point<Pixels>;
     fn modifiers(&self) -> Modifiers;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler>;
     fn prompt(
@@ -157,27 +199,32 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         msg: &str,
         detail: Option<&str>,
         answers: &[&str],
-    ) -> oneshot::Receiver<usize>;
+    ) -> Option<oneshot::Receiver<usize>>;
     fn activate(&self);
+    fn is_active(&self) -> bool;
     fn set_title(&mut self, title: &str);
+    fn set_app_id(&mut self, app_id: &str);
+    fn set_background_appearance(&mut self, background_appearance: WindowBackgroundAppearance);
     fn set_edited(&mut self, edited: bool);
     fn show_character_palette(&self);
     fn minimize(&self);
     fn zoom(&self);
-    fn toggle_full_screen(&self);
+    fn toggle_fullscreen(&self);
+    fn is_fullscreen(&self) -> bool;
     fn on_request_frame(&self, callback: Box<dyn FnMut()>);
-    fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> bool>);
+    fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);
     fn on_resize(&self, callback: Box<dyn FnMut(Size<Pixels>, f32)>);
-    fn on_fullscreen(&self, callback: Box<dyn FnMut(bool)>);
     fn on_moved(&self, callback: Box<dyn FnMut()>);
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>);
     fn on_close(&self, callback: Box<dyn FnOnce()>);
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
-    fn is_topmost_for_position(&self, position: Point<Pixels>) -> bool;
     fn draw(&self, scene: &Scene);
-
+    fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+
+    #[cfg(target_os = "windows")]
+    fn get_raw_handle(&self) -> windows::HWND;
 
     #[cfg(any(test, feature = "test-support"))]
     fn as_test(&mut self) -> Option<&mut TestWindow> {
@@ -219,13 +266,6 @@ pub(crate) trait PlatformTextSystem: Send + Sync {
         raster_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)>;
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout;
-    fn wrap_line(
-        &self,
-        text: &str,
-        font_id: FontId,
-        font_size: Pixels,
-        width: Pixels,
-    ) -> Vec<usize>;
 }
 
 /// Basic metadata about the current application and operating system.
@@ -295,6 +335,7 @@ pub(crate) trait PlatformAtlas: Send + Sync {
 pub(crate) struct AtlasTile {
     pub(crate) texture_id: AtlasTextureId,
     pub(crate) tile_id: TileId,
+    pub(crate) padding: u32,
     pub(crate) bounds: Bounds<DevicePixels>,
 }
 
@@ -399,11 +440,8 @@ impl PlatformInputHandler {
             .flatten()
     }
 
-    pub(crate) fn flush_pending_input(&mut self, input: &str, cx: &mut WindowContext) {
-        let Some(range) = self.handler.selected_text_range(cx) else {
-            return;
-        };
-        self.handler.replace_text_in_range(Some(range), input, cx);
+    pub(crate) fn dispatch_input(&mut self, input: &str, cx: &mut WindowContext) {
+        self.handler.replace_text_in_range(None, input, cx);
     }
 }
 
@@ -477,14 +515,13 @@ pub trait InputHandler: 'static {
 /// The variables that can be configured when creating a new window
 #[derive(Debug)]
 pub struct WindowOptions {
-    /// The initial bounds of the window
-    pub bounds: WindowBounds,
+    /// Specifies the state and bounds of the window in screen coordinates.
+    /// - `None`: Inherit the bounds.
+    /// - `Some(WindowBounds)`: Open a window with corresponding state and its restore size.
+    pub window_bounds: Option<WindowBounds>,
 
     /// The titlebar configuration of the window
     pub titlebar: Option<TitlebarOptions>,
-
-    /// Whether the window should be centered on the screen
-    pub center: bool,
 
     /// Whether the window should be focused when created
     pub focus: bool,
@@ -498,25 +535,86 @@ pub struct WindowOptions {
     /// Whether the window should be movable by the user
     pub is_movable: bool,
 
-    /// The display to create the window on
+    /// The display to create the window on, if this is None,
+    /// the window will be created on the main display
     pub display_id: Option<DisplayId>,
+
+    /// The appearance of the window background.
+    pub window_background: WindowBackgroundAppearance,
+
+    /// Application identifier of the window. Can by used by desktop environments to group applications together.
+    pub app_id: Option<String>,
+}
+
+/// The variables that can be configured when creating a new window
+#[derive(Debug)]
+pub(crate) struct WindowParams {
+    pub bounds: Bounds<DevicePixels>,
+
+    /// The titlebar configuration of the window
+    pub titlebar: Option<TitlebarOptions>,
+
+    /// The kind of window to create
+    pub kind: WindowKind,
+
+    /// Whether the window should be movable by the user
+    pub is_movable: bool,
+
+    pub focus: bool,
+
+    pub show: bool,
+
+    pub display_id: Option<DisplayId>,
+
+    pub window_background: WindowBackgroundAppearance,
+}
+
+/// Represents the status of how a window should be opened.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum WindowBounds {
+    /// Indicates that the window should open in a windowed state with the given bounds.
+    Windowed(Bounds<DevicePixels>),
+    /// Indicates that the window should open in a maximized state.
+    /// The bounds provided here represent the restore size of the window.
+    Maximized(Bounds<DevicePixels>),
+    /// Indicates that the window should open in fullscreen mode.
+    /// The bounds provided here represent the restore size of the window.
+    Fullscreen(Bounds<DevicePixels>),
+}
+
+impl Default for WindowBounds {
+    fn default() -> Self {
+        WindowBounds::Windowed(Bounds::default())
+    }
+}
+
+impl WindowBounds {
+    /// Retrieve the inner bounds
+    pub fn get_bounds(&self) -> Bounds<DevicePixels> {
+        match self {
+            WindowBounds::Windowed(bounds) => *bounds,
+            WindowBounds::Maximized(bounds) => *bounds,
+            WindowBounds::Fullscreen(bounds) => *bounds,
+        }
+    }
 }
 
 impl Default for WindowOptions {
     fn default() -> Self {
         Self {
-            bounds: WindowBounds::default(),
+            window_bounds: None,
             titlebar: Some(TitlebarOptions {
                 title: Default::default(),
                 appears_transparent: Default::default(),
                 traffic_light_position: Default::default(),
             }),
-            center: false,
             focus: true,
             show: true,
             kind: WindowKind::Normal,
             is_movable: true,
             display_id: None,
+            window_background: WindowBackgroundAppearance::default(),
+            app_id: None,
         }
     }
 }
@@ -545,43 +643,30 @@ pub enum WindowKind {
     PopUp,
 }
 
-/// Which bounds algorithm to use for the initial size a window
-#[derive(Copy, Clone, Debug, PartialEq, Default)]
-pub enum WindowBounds {
-    /// The window should be full screen, on macOS this corresponds to the full screen feature
-    Fullscreen,
-
-    /// Make the window as large as the current display's size.
-    #[default]
-    Maximized,
-
-    /// Set the window to the given size in pixels
-    Fixed(Bounds<GlobalPixels>),
-}
-
-/// The appearance of the window, as defined by the operating system
-/// On macOS, this corresponds to named [NSAppearance](https://developer.apple.com/documentation/appkit/nsappearance)
-/// values
+/// The appearance of the window, as defined by the operating system.
+///
+/// On macOS, this corresponds to named [`NSAppearance`](https://developer.apple.com/documentation/appkit/nsappearance)
+/// values.
 #[derive(Copy, Clone, Debug)]
 pub enum WindowAppearance {
-    /// A light appearance
+    /// A light appearance.
     ///
-    /// on macOS, this corresponds to the `aqua` appearance
+    /// On macOS, this corresponds to the `aqua` appearance.
     Light,
 
-    /// A light appearance with vibrant colors
+    /// A light appearance with vibrant colors.
     ///
-    /// on macOS, this corresponds to the `NSAppearanceNameVibrantLight` appearance
+    /// On macOS, this corresponds to the `NSAppearanceNameVibrantLight` appearance.
     VibrantLight,
 
-    /// A dark appearance
+    /// A dark appearance.
     ///
-    /// on macOS, this corresponds to the `darkAqua` appearance
+    /// On macOS, this corresponds to the `darkAqua` appearance.
     Dark,
 
-    /// A dark appearance with vibrant colors
+    /// A dark appearance with vibrant colors.
     ///
-    /// on macOS, this corresponds to the `NSAppearanceNameVibrantDark` appearance
+    /// On macOS, this corresponds to the `NSAppearanceNameVibrantDark` appearance.
     VibrantDark,
 }
 
@@ -589,6 +674,27 @@ impl Default for WindowAppearance {
     fn default() -> Self {
         Self::Light
     }
+}
+
+/// The appearance of the background of the window itself, when there is
+/// no content or the content is transparent.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub enum WindowBackgroundAppearance {
+    /// Opaque.
+    ///
+    /// This lets the window manager know that content behind this
+    /// window does not need to be drawn.
+    ///
+    /// Actual color depends on the system and themes should define a fully
+    /// opaque background color instead.
+    #[default]
+    Opaque,
+    /// Plain alpha transparency.
+    Transparent,
+    /// Transparency, but the contents behind the window are blurred.
+    ///
+    /// Not always supported.
+    Blurred,
 }
 
 /// The options that can be configured for a file dialog prompt
@@ -603,7 +709,7 @@ pub struct PathPromptOptions {
 }
 
 /// What kind of prompt styling to show
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PromptLevel {
     /// A prompt that is shown when the user should be notified of something
     Info,
@@ -613,10 +719,14 @@ pub enum PromptLevel {
 
     /// A prompt that is shown when a critical problem has occurred
     Critical,
+
+    /// A prompt that is shown when asking the user to confirm a potentially destructive action
+    /// (overwriting a file for example)
+    Destructive,
 }
 
 /// The style of the cursor (pointer)
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CursorStyle {
     /// The default cursor
     Arrow,
@@ -650,7 +760,7 @@ pub enum CursorStyle {
     ResizeRight,
 
     /// A resize cursor to the left and right
-    /// corresponds to the CSS cursor value `col-resize`
+    /// corresponds to the CSS cursor value `ew-resize`
     ResizeLeftRight,
 
     /// A resize up cursor
@@ -662,8 +772,16 @@ pub enum CursorStyle {
     ResizeDown,
 
     /// A resize cursor directing up and down
-    /// corresponds to the CSS cursor value `row-resize`
+    /// corresponds to the CSS cursor value `ns-resize`
     ResizeUpDown,
+
+    /// A cursor indicating that the item/column can be resized horizontally.
+    /// corresponds to the CSS curosr value `col-resize`
+    ResizeColumn,
+
+    /// A cursor indicating that the item/row can be resized vertically.
+    /// corresponds to the CSS curosr value `row-resize`
+    ResizeRow,
 
     /// A cursor indicating that something will disappear if moved here
     /// Does not correspond to a CSS cursor value

@@ -1,3 +1,0 @@
-name = "Beancount"
-path_suffixes = ["beancount"]
-brackets = [{ start = "\"", end = "\"", close = false, newline = false }]

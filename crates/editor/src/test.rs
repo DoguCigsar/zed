@@ -6,7 +6,7 @@ use crate::{
     DisplayPoint, Editor, EditorMode, MultiBuffer,
 };
 
-use gpui::{Context, Model, Pixels, ViewContext};
+use gpui::{Context, Font, FontFeatures, FontStyle, FontWeight, Model, Pixels, ViewContext};
 
 use project::Project;
 use util::test::{marked_text_offsets, marked_text_ranges};
@@ -26,7 +26,12 @@ pub fn marked_display_snapshot(
 ) -> (DisplaySnapshot, Vec<DisplayPoint>) {
     let (unmarked_text, markers) = marked_text_offsets(text);
 
-    let font = cx.text_style().font();
+    let font = Font {
+        family: "Courier".into(),
+        features: FontFeatures::default(),
+        weight: FontWeight::default(),
+        style: FontStyle::default(),
+    };
     let font_size: Pixels = 14usize.into();
 
     let buffer = MultiBuffer::build_simple(&unmarked_text, cx);
@@ -69,4 +74,92 @@ pub(crate) fn build_editor_with_project(
     cx: &mut ViewContext<Editor>,
 ) -> Editor {
     Editor::new(EditorMode::Full, buffer, Some(project), cx)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn editor_hunks(
+    editor: &Editor,
+    snapshot: &DisplaySnapshot,
+    cx: &mut ViewContext<'_, Editor>,
+) -> Vec<(String, git::diff::DiffHunkStatus, core::ops::Range<u32>)> {
+    use text::Point;
+
+    snapshot
+        .buffer_snapshot
+        .git_diff_hunks_in_range(0..u32::MAX)
+        .map(|hunk| {
+            let display_range = Point::new(hunk.associated_range.start, 0)
+                .to_display_point(snapshot)
+                .row()
+                ..Point::new(hunk.associated_range.end, 0)
+                    .to_display_point(snapshot)
+                    .row();
+            let (_, buffer, _) = editor
+                .buffer()
+                .read(cx)
+                .excerpt_containing(Point::new(hunk.associated_range.start, 0), cx)
+                .expect("no excerpt for expanded buffer's hunk start");
+            let diff_base = buffer
+                .read(cx)
+                .diff_base()
+                .expect("should have a diff base for expanded hunk")
+                .slice(hunk.diff_base_byte_range.clone())
+                .to_string();
+            (diff_base, hunk.status(), display_range)
+        })
+        .collect()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn expanded_hunks(
+    editor: &Editor,
+    snapshot: &DisplaySnapshot,
+    cx: &mut ViewContext<'_, Editor>,
+) -> Vec<(String, git::diff::DiffHunkStatus, core::ops::Range<u32>)> {
+    editor
+        .expanded_hunks
+        .hunks(false)
+        .map(|expanded_hunk| {
+            let hunk_display_range = expanded_hunk
+                .hunk_range
+                .start
+                .to_display_point(snapshot)
+                .row()
+                ..expanded_hunk
+                    .hunk_range
+                    .end
+                    .to_display_point(snapshot)
+                    .row();
+            let (_, buffer, _) = editor
+                .buffer()
+                .read(cx)
+                .excerpt_containing(expanded_hunk.hunk_range.start, cx)
+                .expect("no excerpt for expanded buffer's hunk start");
+            let diff_base = buffer
+                .read(cx)
+                .diff_base()
+                .expect("should have a diff base for expanded hunk")
+                .slice(expanded_hunk.diff_base_byte_range.clone())
+                .to_string();
+            (diff_base, expanded_hunk.status, hunk_display_range)
+        })
+        .collect()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn expanded_hunks_background_highlights(
+    editor: &Editor,
+    snapshot: &DisplaySnapshot,
+) -> Vec<core::ops::Range<u32>> {
+    use itertools::Itertools;
+
+    editor
+        .highlighted_rows::<crate::DiffRowHighlight>()
+        .into_iter()
+        .flatten()
+        .map(|(range, _)| {
+            range.start.to_display_point(snapshot).row()..range.end.to_display_point(snapshot).row()
+        })
+        .unique()
+        .collect()
 }

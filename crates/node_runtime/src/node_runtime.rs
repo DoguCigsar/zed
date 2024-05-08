@@ -1,8 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
-use async_compression::futures::bufread::GzipDecoder;
-use async_tar::Archive;
+use futures::AsyncReadExt;
+use semver::Version;
 use serde::Deserialize;
-use smol::{fs, io::BufReader, lock::Mutex, process::Command};
+use smol::{fs, lock::Mutex, process::Command};
+use std::io;
 use std::process::{Output, Stdio};
 use std::{
     env::consts,
@@ -10,8 +11,22 @@ use std::{
     sync::Arc,
 };
 use util::http::HttpClient;
+use util::ResultExt;
+
+#[cfg(windows)]
+use smol::process::windows::CommandExt;
 
 const VERSION: &str = "v18.15.0";
+
+#[cfg(windows)]
+const NODE_PATH: &str = "node.exe";
+#[cfg(not(windows))]
+const NODE_PATH: &str = "bin/node";
+
+#[cfg(windows)]
+const NPM_PATH: &str = "node_modules/npm/bin/npm-cli.js";
+#[cfg(not(windows))]
+const NPM_PATH: &str = "bin/npm";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -41,6 +56,45 @@ pub trait NodeRuntime: Send + Sync {
 
     async fn npm_install_packages(&self, directory: &Path, packages: &[(&str, &str)])
         -> Result<()>;
+
+    async fn npm_package_installed_version(
+        &self,
+        local_package_directory: &PathBuf,
+        name: &str,
+    ) -> Result<Option<String>>;
+
+    async fn should_install_npm_package(
+        &self,
+        package_name: &str,
+        local_executable_path: &Path,
+        local_package_directory: &PathBuf,
+        latest_version: &str,
+    ) -> bool {
+        // In the case of the local system not having the package installed,
+        // or in the instances where we fail to parse package.json data,
+        // we attempt to install the package.
+        if fs::metadata(local_executable_path).await.is_err() {
+            return true;
+        }
+
+        let Some(installed_version) = self
+            .npm_package_installed_version(local_package_directory, package_name)
+            .await
+            .log_err()
+            .flatten()
+        else {
+            return true;
+        };
+
+        let Some(installed_version) = Version::parse(&installed_version).log_err() else {
+            return true;
+        };
+        let Some(latest_version) = Version::parse(&latest_version).log_err() else {
+            return true;
+        };
+
+        installed_version < latest_version
+    }
 }
 
 pub struct RealNodeRuntime {
@@ -60,19 +114,28 @@ impl RealNodeRuntime {
         let _lock = self.installation_lock.lock().await;
         log::info!("Node runtime install_if_needed");
 
+        let os = match consts::OS {
+            "macos" => "darwin",
+            "linux" => "linux",
+            "windows" => "win",
+            other => bail!("Running on unsupported os: {other}"),
+        };
+
         let arch = match consts::ARCH {
             "x86_64" => "x64",
             "aarch64" => "arm64",
-            other => bail!("Running on unsupported platform: {other}"),
+            other => bail!("Running on unsupported architecture: {other}"),
         };
 
-        let folder_name = format!("node-{VERSION}-darwin-{arch}");
+        let folder_name = format!("node-{VERSION}-{os}-{arch}");
         let node_containing_dir = util::paths::SUPPORT_DIR.join("node");
         let node_dir = node_containing_dir.join(folder_name);
-        let node_binary = node_dir.join("bin/node");
-        let npm_file = node_dir.join("bin/npm");
+        let node_binary = node_dir.join(NODE_PATH);
+        let npm_file = node_dir.join(NPM_PATH);
 
-        let result = Command::new(&node_binary)
+        let mut command = Command::new(&node_binary);
+
+        command
             .env_clear()
             .arg(npm_file)
             .arg("--version")
@@ -81,9 +144,12 @@ impl RealNodeRuntime {
             .stderr(Stdio::null())
             .args(["--cache".into(), node_dir.join("cache")])
             .args(["--userconfig".into(), node_dir.join("blank_user_npmrc")])
-            .args(["--globalconfig".into(), node_dir.join("blank_global_npmrc")])
-            .status()
-            .await;
+            .args(["--globalconfig".into(), node_dir.join("blank_global_npmrc")]);
+
+        #[cfg(windows)]
+        command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
+
+        let result = command.status().await;
         let valid = matches!(result, Ok(status) if status.success());
 
         if !valid {
@@ -92,7 +158,13 @@ impl RealNodeRuntime {
                 .await
                 .context("error creating node containing dir")?;
 
-            let file_name = format!("node-{VERSION}-darwin-{arch}.tar.gz");
+            let ext = match consts::OS {
+                "windows" => "zip",
+                "linux" | "macos" => "tar.gz",
+                other => bail!("Running on unsupported os: {other}"),
+            };
+
+            let file_name = format!("node-{VERSION}-{os}-{arch}.{ext}");
             let url = format!("https://nodejs.org/dist/{VERSION}/{file_name}");
             let mut response = self
                 .http
@@ -100,9 +172,12 @@ impl RealNodeRuntime {
                 .await
                 .context("error downloading Node binary tarball")?;
 
-            let decompressed_bytes = GzipDecoder::new(BufReader::new(response.body_mut()));
-            let archive = Archive::new(decompressed_bytes);
-            archive.unpack(&node_containing_dir).await?;
+            let body = response.body_mut();
+            match ext {
+                "zip" => archive::extract_zip(&node_containing_dir, body).await?,
+                "tar.gz" => archive::extract_tar_gz(&node_containing_dir, body).await?,
+                other => bail!("Unsupported extract extension: {other}"),
+            }
         }
 
         // Note: Not in the `if !valid {}` so we can populate these for existing installations
@@ -118,7 +193,7 @@ impl RealNodeRuntime {
 impl NodeRuntime for RealNodeRuntime {
     async fn binary_path(&self) -> Result<PathBuf> {
         let installation_path = self.install_if_needed().await?;
-        Ok(installation_path.join("bin/node"))
+        Ok(installation_path.join(NODE_PATH))
     }
 
     async fn run_npm_subcommand(
@@ -130,16 +205,16 @@ impl NodeRuntime for RealNodeRuntime {
         let attempt = || async move {
             let installation_path = self.install_if_needed().await?;
 
-            let mut env_path = installation_path.join("bin").into_os_string();
+            let node_binary = installation_path.join(NODE_PATH);
+            let npm_file = installation_path.join(NPM_PATH);
+            let mut env_path = node_binary.parent().unwrap().to_path_buf();
+
             if let Some(existing_path) = std::env::var_os("PATH") {
                 if !existing_path.is_empty() {
                     env_path.push(":");
                     env_path.push(&existing_path);
                 }
             }
-
-            let node_binary = installation_path.join("bin/node");
-            let npm_file = installation_path.join("bin/npm");
 
             if smol::fs::metadata(&node_binary).await.is_err() {
                 return Err(anyhow!("missing node binary file"));
@@ -150,24 +225,35 @@ impl NodeRuntime for RealNodeRuntime {
             }
 
             let mut command = Command::new(node_binary);
-            command.env_clear();
-            command.env("PATH", env_path);
-            command.arg(npm_file).arg(subcommand);
-            command.args(["--cache".into(), installation_path.join("cache")]);
-            command.args([
-                "--userconfig".into(),
-                installation_path.join("blank_user_npmrc"),
-            ]);
-            command.args([
-                "--globalconfig".into(),
-                installation_path.join("blank_global_npmrc"),
-            ]);
-            command.args(args);
+            command
+                .env_clear()
+                .env("PATH", env_path)
+                .arg(npm_file)
+                .arg(subcommand)
+                .args(["--cache".into(), installation_path.join("cache")])
+                .args([
+                    "--userconfig".into(),
+                    installation_path.join("blank_user_npmrc"),
+                ])
+                .args([
+                    "--globalconfig".into(),
+                    installation_path.join("blank_global_npmrc"),
+                ])
+                .args(args);
+
+            // Set proxy arg, if user's env has `http_proxy`.
+            if let Some(http_proxy) = std::env::var("http_proxy").ok() {
+                command.env("http_proxy", http_proxy);
+            }
 
             if let Some(directory) = directory {
-                command.current_dir(directory);
-                command.args(["--prefix".into(), directory.to_path_buf()]);
+                command
+                    .current_dir(directory)
+                    .args(["--prefix".into(), directory.to_path_buf()]);
             }
+
+            #[cfg(windows)]
+            command.creation_flags(windows::Win32::System::Threading::CREATE_NO_WINDOW.0);
 
             command.output().await.map_err(|e| anyhow!("{e}"))
         };
@@ -177,7 +263,8 @@ impl NodeRuntime for RealNodeRuntime {
             output = attempt().await;
             if output.is_err() {
                 return Err(anyhow!(
-                    "failed to launch npm subcommand {subcommand} subcommand"
+                    "failed to launch npm subcommand {subcommand} subcommand\nerr: {:?}",
+                    output.err()
                 ));
             }
         }
@@ -220,6 +307,36 @@ impl NodeRuntime for RealNodeRuntime {
             .ok_or_else(|| anyhow!("no version found for npm package {}", name))
     }
 
+    async fn npm_package_installed_version(
+        &self,
+        local_package_directory: &PathBuf,
+        name: &str,
+    ) -> Result<Option<String>> {
+        let mut package_json_path = local_package_directory.clone();
+        package_json_path.extend(["node_modules", name, "package.json"]);
+
+        let mut file = match fs::File::open(package_json_path).await {
+            Ok(file) => file,
+            Err(err) => {
+                if err.kind() == io::ErrorKind::NotFound {
+                    return Ok(None);
+                }
+
+                Err(err)?
+            }
+        };
+
+        #[derive(Deserialize)]
+        struct PackageJson {
+            version: String,
+        }
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).await?;
+        let package_json: PackageJson = serde_json::from_str(&contents)?;
+        Ok(Some(package_json.version))
+    }
+
     async fn npm_install_packages(
         &self,
         directory: &Path,
@@ -232,6 +349,7 @@ impl NodeRuntime for RealNodeRuntime {
 
         let mut arguments: Vec<_> = packages.iter().map(|p| p.as_str()).collect();
         arguments.extend_from_slice(&[
+            "--save-exact",
             "--fetch-retry-mintimeout",
             "2000",
             "--fetch-retry-maxtimeout",
@@ -271,6 +389,14 @@ impl NodeRuntime for FakeNodeRuntime {
 
     async fn npm_package_latest_version(&self, name: &str) -> anyhow::Result<String> {
         unreachable!("Should not query npm package '{name}' for latest version")
+    }
+
+    async fn npm_package_installed_version(
+        &self,
+        _local_package_directory: &PathBuf,
+        name: &str,
+    ) -> Result<Option<String>> {
+        unreachable!("Should not query npm package '{name}' for installed version")
     }
 
     async fn npm_install_packages(

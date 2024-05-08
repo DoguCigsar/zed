@@ -6,26 +6,27 @@ use collections::HashSet;
 use editor::{scroll::Autoscroll, Editor};
 use futures::{stream::FuturesUnordered, StreamExt};
 use gpui::{
-    div, impl_actions, overlay, AnyElement, AppContext, DismissEvent, EventEmitter, FocusHandle,
-    FocusableView, KeyContext, KeyDownEvent, Keystroke, Model, MouseButton, MouseDownEvent, Pixels,
-    Render, Styled, Subscription, Task, View, VisualContext, WeakView,
+    anchored, deferred, div, impl_actions, AnyElement, AppContext, DismissEvent, EventEmitter,
+    FocusHandle, FocusableView, KeyContext, KeyDownEvent, Keystroke, Model, MouseButton,
+    MouseDownEvent, Pixels, Render, Styled, Subscription, Task, View, VisualContext, WeakView,
 };
 use language::Bias;
 use persistence::TERMINAL_DB;
 use project::{search::SearchQuery, Fs, LocalWorktree, Metadata, Project};
+use settings::SettingsStore;
 use terminal::{
     alacritty_terminal::{
         index::Point,
         term::{search::RegexSearch, TermMode},
     },
     terminal_settings::{TerminalBlink, TerminalSettings, WorkingDirectory},
-    Clear, Copy, Event, MaybeNavigationTarget, Paste, ShowCharacterPalette, Terminal,
+    Clear, Copy, Event, MaybeNavigationTarget, Paste, ShowCharacterPalette, TaskStatus, Terminal,
 };
 use terminal_element::TerminalElement;
 use ui::{h_flex, prelude::*, ContextMenu, Icon, IconName, Label};
 use util::{paths::PathLikeWithPosition, ResultExt};
 use workspace::{
-    item::{BreadcrumbText, Item, ItemEvent},
+    item::{BreadcrumbText, Item, ItemEvent, TabContentParams},
     notifications::NotifyResultExt,
     register_deserializable_item,
     searchable::{SearchEvent, SearchOptions, SearchableItem, SearchableItemHandle},
@@ -45,6 +46,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
+const REGEX_SPECIAL_CHARS: &[char] = &[
+    '\\', '.', '*', '+', '?', '|', '(', ')', '[', ']', '{', '}', '^', '$',
+];
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -77,7 +82,6 @@ pub struct TerminalView {
     terminal: Model<Terminal>,
     workspace: WeakView<Workspace>,
     focus_handle: FocusHandle,
-    has_new_content: bool,
     //Currently using iTerm bell, show bell emoji in tab until input is received
     has_bell: bool,
     context_menu: Option<(View<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
@@ -87,7 +91,9 @@ pub struct TerminalView {
     blink_epoch: usize,
     can_navigate_to_selected_word: bool,
     workspace_id: WorkspaceId,
+    show_title: bool,
     _subscriptions: Vec<Subscription>,
+    _terminal_subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<Event> for TerminalView {}
@@ -115,7 +121,7 @@ impl TerminalView {
         let terminal = workspace
             .project()
             .update(cx, |project, cx| {
-                project.create_terminal(working_directory, window, cx)
+                project.create_terminal(working_directory, None, window, cx)
             })
             .notify_err(workspace, cx);
 
@@ -128,7 +134,7 @@ impl TerminalView {
                     cx,
                 )
             });
-            workspace.add_item(Box::new(view), cx)
+            workspace.add_item_to_active_pane(Box::new(view), None, cx)
         }
     }
 
@@ -139,12 +145,299 @@ impl TerminalView {
         cx: &mut ViewContext<Self>,
     ) -> Self {
         let workspace_handle = workspace.clone();
-        cx.observe(&terminal, |_, _, cx| cx.notify()).detach();
-        cx.subscribe(&terminal, move |this, _, event, cx| match event {
-            Event::Wakeup => {
-                if !this.focus_handle.is_focused(cx) {
-                    this.has_new_content = true;
+        let terminal_subscriptions = subscribe_for_terminal_events(&terminal, workspace, cx);
+
+        let focus_handle = cx.focus_handle();
+        let focus_in = cx.on_focus_in(&focus_handle, |terminal_view, cx| {
+            terminal_view.focus_in(cx);
+        });
+        let focus_out = cx.on_focus_out(&focus_handle, |terminal_view, cx| {
+            terminal_view.focus_out(cx);
+        });
+
+        Self {
+            terminal,
+            workspace: workspace_handle,
+            has_bell: false,
+            focus_handle,
+            context_menu: None,
+            blink_state: true,
+            blinking_on: false,
+            blinking_paused: false,
+            blink_epoch: 0,
+            can_navigate_to_selected_word: false,
+            workspace_id,
+            show_title: TerminalSettings::get_global(cx).toolbar.title,
+            _subscriptions: vec![
+                focus_in,
+                focus_out,
+                cx.observe_global::<SettingsStore>(Self::settings_changed),
+            ],
+            _terminal_subscriptions: terminal_subscriptions,
+        }
+    }
+
+    pub fn model(&self) -> &Model<Terminal> {
+        &self.terminal
+    }
+
+    pub fn has_bell(&self) -> bool {
+        self.has_bell
+    }
+
+    pub fn clear_bell(&mut self, cx: &mut ViewContext<TerminalView>) {
+        self.has_bell = false;
+        cx.emit(Event::Wakeup);
+    }
+
+    pub fn deploy_context_menu(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        cx: &mut ViewContext<Self>,
+    ) {
+        let context_menu = ContextMenu::build(cx, |menu, _| {
+            menu.action("Clear", Box::new(Clear))
+                .action("Close", Box::new(CloseActiveItem { save_intent: None }))
+        });
+
+        cx.focus_view(&context_menu);
+        let subscription =
+            cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+                if this.context_menu.as_ref().is_some_and(|context_menu| {
+                    context_menu.0.focus_handle(cx).contains_focused(cx)
+                }) {
+                    cx.focus_self();
                 }
+                this.context_menu.take();
+                cx.notify();
+            });
+
+        self.context_menu = Some((context_menu, position, subscription));
+    }
+
+    fn settings_changed(&mut self, cx: &mut ViewContext<Self>) {
+        let settings = TerminalSettings::get_global(cx);
+        self.show_title = settings.toolbar.title;
+        cx.notify();
+    }
+
+    fn show_character_palette(&mut self, _: &ShowCharacterPalette, cx: &mut ViewContext<Self>) {
+        if self
+            .terminal
+            .read(cx)
+            .last_content
+            .mode
+            .contains(TermMode::ALT_SCREEN)
+        {
+            self.terminal.update(cx, |term, cx| {
+                term.try_keystroke(
+                    &Keystroke::parse("ctrl-cmd-space").unwrap(),
+                    TerminalSettings::get_global(cx).option_as_meta,
+                )
+            });
+        } else {
+            cx.show_character_palette();
+        }
+    }
+
+    fn select_all(&mut self, _: &editor::actions::SelectAll, cx: &mut ViewContext<Self>) {
+        self.terminal.update(cx, |term, _| term.select_all());
+        cx.notify();
+    }
+
+    fn clear(&mut self, _: &Clear, cx: &mut ViewContext<Self>) {
+        self.terminal.update(cx, |term, _| term.clear());
+        cx.notify();
+    }
+
+    pub fn should_show_cursor(&self, focused: bool, cx: &mut gpui::ViewContext<Self>) -> bool {
+        //Don't blink the cursor when not focused, blinking is disabled, or paused
+        if !focused
+            || !self.blinking_on
+            || self.blinking_paused
+            || self
+                .terminal
+                .read(cx)
+                .last_content
+                .mode
+                .contains(TermMode::ALT_SCREEN)
+        {
+            return true;
+        }
+
+        match TerminalSettings::get_global(cx).blinking {
+            //If the user requested to never blink, don't blink it.
+            TerminalBlink::Off => true,
+            //If the terminal is controlling it, check terminal mode
+            TerminalBlink::TerminalControlled | TerminalBlink::On => self.blink_state,
+        }
+    }
+
+    fn blink_cursors(&mut self, epoch: usize, cx: &mut ViewContext<Self>) {
+        if epoch == self.blink_epoch && !self.blinking_paused {
+            self.blink_state = !self.blink_state;
+            cx.notify();
+
+            let epoch = self.next_blink_epoch();
+            cx.spawn(|this, mut cx| async move {
+                Timer::after(CURSOR_BLINK_INTERVAL).await;
+                this.update(&mut cx, |this, cx| this.blink_cursors(epoch, cx))
+                    .log_err();
+            })
+            .detach();
+        }
+    }
+
+    pub fn pause_cursor_blinking(&mut self, cx: &mut ViewContext<Self>) {
+        self.blink_state = true;
+        cx.notify();
+
+        let epoch = self.next_blink_epoch();
+        cx.spawn(|this, mut cx| async move {
+            Timer::after(CURSOR_BLINK_INTERVAL).await;
+            this.update(&mut cx, |this, cx| this.resume_cursor_blinking(epoch, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    pub fn terminal(&self) -> &Model<Terminal> {
+        &self.terminal
+    }
+
+    fn next_blink_epoch(&mut self) -> usize {
+        self.blink_epoch += 1;
+        self.blink_epoch
+    }
+
+    fn resume_cursor_blinking(&mut self, epoch: usize, cx: &mut ViewContext<Self>) {
+        if epoch == self.blink_epoch {
+            self.blinking_paused = false;
+            self.blink_cursors(epoch, cx);
+        }
+    }
+
+    ///Attempt to paste the clipboard into the terminal
+    fn copy(&mut self, _: &Copy, cx: &mut ViewContext<Self>) {
+        self.terminal.update(cx, |term, _| term.copy());
+        cx.notify();
+    }
+
+    ///Attempt to paste the clipboard into the terminal
+    fn paste(&mut self, _: &Paste, cx: &mut ViewContext<Self>) {
+        if let Some(item) = cx.read_from_clipboard() {
+            self.terminal
+                .update(cx, |terminal, _cx| terminal.paste(item.text()));
+        }
+    }
+
+    fn send_text(&mut self, text: &SendText, cx: &mut ViewContext<Self>) {
+        self.clear_bell(cx);
+        self.terminal.update(cx, |term, _| {
+            term.input(text.0.to_string());
+        });
+    }
+
+    fn send_keystroke(&mut self, text: &SendKeystroke, cx: &mut ViewContext<Self>) {
+        if let Some(keystroke) = Keystroke::parse(&text.0).log_err() {
+            self.clear_bell(cx);
+            self.terminal.update(cx, |term, cx| {
+                term.try_keystroke(&keystroke, TerminalSettings::get_global(cx).option_as_meta);
+            });
+        }
+    }
+
+    fn dispatch_context(&self, cx: &AppContext) -> KeyContext {
+        let mut dispatch_context = KeyContext::new_with_defaults();
+        dispatch_context.add("Terminal");
+
+        let mode = self.terminal.read(cx).last_content.mode;
+        dispatch_context.set(
+            "screen",
+            if mode.contains(TermMode::ALT_SCREEN) {
+                "alt"
+            } else {
+                "normal"
+            },
+        );
+
+        if mode.contains(TermMode::APP_CURSOR) {
+            dispatch_context.add("DECCKM");
+        }
+        if mode.contains(TermMode::APP_KEYPAD) {
+            dispatch_context.add("DECPAM");
+        } else {
+            dispatch_context.add("DECPNM");
+        }
+        if mode.contains(TermMode::SHOW_CURSOR) {
+            dispatch_context.add("DECTCEM");
+        }
+        if mode.contains(TermMode::LINE_WRAP) {
+            dispatch_context.add("DECAWM");
+        }
+        if mode.contains(TermMode::ORIGIN) {
+            dispatch_context.add("DECOM");
+        }
+        if mode.contains(TermMode::INSERT) {
+            dispatch_context.add("IRM");
+        }
+        //LNM is apparently the name for this. https://vt100.net/docs/vt510-rm/LNM.html
+        if mode.contains(TermMode::LINE_FEED_NEW_LINE) {
+            dispatch_context.add("LNM");
+        }
+        if mode.contains(TermMode::FOCUS_IN_OUT) {
+            dispatch_context.add("report_focus");
+        }
+        if mode.contains(TermMode::ALTERNATE_SCROLL) {
+            dispatch_context.add("alternate_scroll");
+        }
+        if mode.contains(TermMode::BRACKETED_PASTE) {
+            dispatch_context.add("bracketed_paste");
+        }
+        if mode.intersects(TermMode::MOUSE_MODE) {
+            dispatch_context.add("any_mouse_reporting");
+        }
+        {
+            let mouse_reporting = if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+                "click"
+            } else if mode.contains(TermMode::MOUSE_DRAG) {
+                "drag"
+            } else if mode.contains(TermMode::MOUSE_MOTION) {
+                "motion"
+            } else {
+                "off"
+            };
+            dispatch_context.set("mouse_reporting", mouse_reporting);
+        }
+        {
+            let format = if mode.contains(TermMode::SGR_MOUSE) {
+                "sgr"
+            } else if mode.contains(TermMode::UTF8_MOUSE) {
+                "utf8"
+            } else {
+                "normal"
+            };
+            dispatch_context.set("mouse_format", format);
+        };
+        dispatch_context
+    }
+
+    fn set_terminal(&mut self, terminal: Model<Terminal>, cx: &mut ViewContext<'_, TerminalView>) {
+        self._terminal_subscriptions =
+            subscribe_for_terminal_events(&terminal, self.workspace.clone(), cx);
+        self.terminal = terminal;
+    }
+}
+
+fn subscribe_for_terminal_events(
+    terminal: &Model<Terminal>,
+    workspace: WeakView<Workspace>,
+    cx: &mut ViewContext<'_, TerminalView>,
+) -> Vec<Subscription> {
+    let terminal_subscription = cx.observe(terminal, |_, _, cx| cx.notify());
+    let terminal_events_subscription =
+        cx.subscribe(terminal, move |this, _, event, cx| match event {
+            Event::Wakeup => {
                 cx.notify();
                 cx.emit(Event::Wakeup);
                 cx.emit(ItemEvent::UpdateTab);
@@ -160,19 +453,20 @@ impl TerminalView {
 
             Event::TitleChanged => {
                 cx.emit(ItemEvent::UpdateTab);
-                if let Some(foreground_info) = &this.terminal().read(cx).foreground_process_info {
-                    let cwd = foreground_info.cwd.clone();
-
-                    let item_id = cx.entity_id();
-                    let workspace_id = this.workspace_id;
-                    cx.background_executor()
-                        .spawn(async move {
-                            TERMINAL_DB
-                                .save_working_directory(item_id.as_u64(), workspace_id, cwd)
-                                .await
-                                .log_err();
-                        })
-                        .detach();
+                let terminal = this.terminal().read(cx);
+                if terminal.task().is_none() {
+                    if let Some(cwd) = terminal.get_cwd() {
+                        let item_id = cx.entity_id();
+                        let workspace_id = this.workspace_id;
+                        cx.background_executor()
+                            .spawn(async move {
+                                TERMINAL_DB
+                                    .save_working_directory(item_id.as_u64(), workspace_id, cwd)
+                                    .await
+                                    .log_err();
+                            })
+                            .detach();
+                    }
                 }
             }
 
@@ -295,291 +589,8 @@ impl TerminalView {
             Event::BreadcrumbsChanged => cx.emit(ItemEvent::UpdateBreadcrumbs),
             Event::CloseTerminal => cx.emit(ItemEvent::CloseItem),
             Event::SelectionsChanged => cx.emit(SearchEvent::ActiveMatchChanged),
-        })
-        .detach();
-
-        let focus_handle = cx.focus_handle();
-        let focus_in = cx.on_focus_in(&focus_handle, |terminal_view, cx| {
-            terminal_view.focus_in(cx);
         });
-        let focus_out = cx.on_focus_out(&focus_handle, |terminal_view, cx| {
-            terminal_view.focus_out(cx);
-        });
-
-        Self {
-            terminal,
-            workspace: workspace_handle,
-            has_new_content: true,
-            has_bell: false,
-            focus_handle: cx.focus_handle(),
-            context_menu: None,
-            blink_state: true,
-            blinking_on: false,
-            blinking_paused: false,
-            blink_epoch: 0,
-            can_navigate_to_selected_word: false,
-            workspace_id,
-            _subscriptions: vec![focus_in, focus_out],
-        }
-    }
-
-    pub fn model(&self) -> &Model<Terminal> {
-        &self.terminal
-    }
-
-    pub fn has_new_content(&self) -> bool {
-        self.has_new_content
-    }
-
-    pub fn has_bell(&self) -> bool {
-        self.has_bell
-    }
-
-    pub fn clear_bel(&mut self, cx: &mut ViewContext<TerminalView>) {
-        self.has_bell = false;
-        cx.emit(Event::Wakeup);
-    }
-
-    pub fn deploy_context_menu(
-        &mut self,
-        position: gpui::Point<Pixels>,
-        cx: &mut ViewContext<Self>,
-    ) {
-        let context_menu = ContextMenu::build(cx, |menu, _| {
-            menu.action("Clear", Box::new(Clear))
-                .action("Close", Box::new(CloseActiveItem { save_intent: None }))
-        });
-
-        cx.focus_view(&context_menu);
-        let subscription =
-            cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
-                if this.context_menu.as_ref().is_some_and(|context_menu| {
-                    context_menu.0.focus_handle(cx).contains_focused(cx)
-                }) {
-                    cx.focus_self();
-                }
-                this.context_menu.take();
-                cx.notify();
-            });
-
-        self.context_menu = Some((context_menu, position, subscription));
-    }
-
-    fn show_character_palette(&mut self, _: &ShowCharacterPalette, cx: &mut ViewContext<Self>) {
-        if !self
-            .terminal
-            .read(cx)
-            .last_content
-            .mode
-            .contains(TermMode::ALT_SCREEN)
-        {
-            cx.show_character_palette();
-        } else {
-            self.terminal.update(cx, |term, cx| {
-                term.try_keystroke(
-                    &Keystroke::parse("ctrl-cmd-space").unwrap(),
-                    TerminalSettings::get_global(cx).option_as_meta,
-                )
-            });
-        }
-    }
-
-    fn select_all(&mut self, _: &editor::actions::SelectAll, cx: &mut ViewContext<Self>) {
-        self.terminal.update(cx, |term, _| term.select_all());
-        cx.notify();
-    }
-
-    fn clear(&mut self, _: &Clear, cx: &mut ViewContext<Self>) {
-        self.terminal.update(cx, |term, _| term.clear());
-        cx.notify();
-    }
-
-    pub fn should_show_cursor(&self, focused: bool, cx: &mut gpui::ViewContext<Self>) -> bool {
-        //Don't blink the cursor when not focused, blinking is disabled, or paused
-        if !focused
-            || !self.blinking_on
-            || self.blinking_paused
-            || self
-                .terminal
-                .read(cx)
-                .last_content
-                .mode
-                .contains(TermMode::ALT_SCREEN)
-        {
-            return true;
-        }
-
-        match TerminalSettings::get_global(cx).blinking {
-            //If the user requested to never blink, don't blink it.
-            TerminalBlink::Off => true,
-            //If the terminal is controlling it, check terminal mode
-            TerminalBlink::TerminalControlled | TerminalBlink::On => self.blink_state,
-        }
-    }
-
-    fn blink_cursors(&mut self, epoch: usize, cx: &mut ViewContext<Self>) {
-        if epoch == self.blink_epoch && !self.blinking_paused {
-            self.blink_state = !self.blink_state;
-            cx.notify();
-
-            let epoch = self.next_blink_epoch();
-            cx.spawn(|this, mut cx| async move {
-                Timer::after(CURSOR_BLINK_INTERVAL).await;
-                this.update(&mut cx, |this, cx| this.blink_cursors(epoch, cx))
-                    .log_err();
-            })
-            .detach();
-        }
-    }
-
-    pub fn pause_cursor_blinking(&mut self, cx: &mut ViewContext<Self>) {
-        self.blink_state = true;
-        cx.notify();
-
-        let epoch = self.next_blink_epoch();
-        cx.spawn(|this, mut cx| async move {
-            Timer::after(CURSOR_BLINK_INTERVAL).await;
-            this.update(&mut cx, |this, cx| this.resume_cursor_blinking(epoch, cx))
-                .ok();
-        })
-        .detach();
-    }
-
-    pub fn find_matches(
-        &mut self,
-        query: Arc<project::search::SearchQuery>,
-        cx: &mut ViewContext<Self>,
-    ) -> Task<Vec<RangeInclusive<Point>>> {
-        let searcher = regex_search_for_query(&query);
-
-        if let Some(searcher) = searcher {
-            self.terminal
-                .update(cx, |term, cx| term.find_matches(searcher, cx))
-        } else {
-            cx.background_executor().spawn(async { Vec::new() })
-        }
-    }
-
-    pub fn terminal(&self) -> &Model<Terminal> {
-        &self.terminal
-    }
-
-    fn next_blink_epoch(&mut self) -> usize {
-        self.blink_epoch += 1;
-        self.blink_epoch
-    }
-
-    fn resume_cursor_blinking(&mut self, epoch: usize, cx: &mut ViewContext<Self>) {
-        if epoch == self.blink_epoch {
-            self.blinking_paused = false;
-            self.blink_cursors(epoch, cx);
-        }
-    }
-
-    ///Attempt to paste the clipboard into the terminal
-    fn copy(&mut self, _: &Copy, cx: &mut ViewContext<Self>) {
-        self.terminal.update(cx, |term, _| term.copy());
-        cx.notify();
-    }
-
-    ///Attempt to paste the clipboard into the terminal
-    fn paste(&mut self, _: &Paste, cx: &mut ViewContext<Self>) {
-        if let Some(item) = cx.read_from_clipboard() {
-            self.terminal
-                .update(cx, |terminal, _cx| terminal.paste(item.text()));
-        }
-    }
-
-    fn send_text(&mut self, text: &SendText, cx: &mut ViewContext<Self>) {
-        self.clear_bel(cx);
-        self.terminal.update(cx, |term, _| {
-            term.input(text.0.to_string());
-        });
-    }
-
-    fn send_keystroke(&mut self, text: &SendKeystroke, cx: &mut ViewContext<Self>) {
-        if let Some(keystroke) = Keystroke::parse(&text.0).log_err() {
-            self.clear_bel(cx);
-            self.terminal.update(cx, |term, cx| {
-                term.try_keystroke(&keystroke, TerminalSettings::get_global(cx).option_as_meta);
-            });
-        }
-    }
-
-    fn dispatch_context(&self, cx: &AppContext) -> KeyContext {
-        let mut dispatch_context = KeyContext::default();
-        dispatch_context.add("Terminal");
-
-        let mode = self.terminal.read(cx).last_content.mode;
-        dispatch_context.set(
-            "screen",
-            if mode.contains(TermMode::ALT_SCREEN) {
-                "alt"
-            } else {
-                "normal"
-            },
-        );
-
-        if mode.contains(TermMode::APP_CURSOR) {
-            dispatch_context.add("DECCKM");
-        }
-        if mode.contains(TermMode::APP_KEYPAD) {
-            dispatch_context.add("DECPAM");
-        } else {
-            dispatch_context.add("DECPNM");
-        }
-        if mode.contains(TermMode::SHOW_CURSOR) {
-            dispatch_context.add("DECTCEM");
-        }
-        if mode.contains(TermMode::LINE_WRAP) {
-            dispatch_context.add("DECAWM");
-        }
-        if mode.contains(TermMode::ORIGIN) {
-            dispatch_context.add("DECOM");
-        }
-        if mode.contains(TermMode::INSERT) {
-            dispatch_context.add("IRM");
-        }
-        //LNM is apparently the name for this. https://vt100.net/docs/vt510-rm/LNM.html
-        if mode.contains(TermMode::LINE_FEED_NEW_LINE) {
-            dispatch_context.add("LNM");
-        }
-        if mode.contains(TermMode::FOCUS_IN_OUT) {
-            dispatch_context.add("report_focus");
-        }
-        if mode.contains(TermMode::ALTERNATE_SCROLL) {
-            dispatch_context.add("alternate_scroll");
-        }
-        if mode.contains(TermMode::BRACKETED_PASTE) {
-            dispatch_context.add("bracketed_paste");
-        }
-        if mode.intersects(TermMode::MOUSE_MODE) {
-            dispatch_context.add("any_mouse_reporting");
-        }
-        {
-            let mouse_reporting = if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
-                "click"
-            } else if mode.contains(TermMode::MOUSE_DRAG) {
-                "drag"
-            } else if mode.contains(TermMode::MOUSE_MOTION) {
-                "motion"
-            } else {
-                "off"
-            };
-            dispatch_context.set("mouse_reporting", mouse_reporting);
-        }
-        {
-            let format = if mode.contains(TermMode::SGR_MOUSE) {
-                "sgr"
-            } else if mode.contains(TermMode::UTF8_MOUSE) {
-                "utf8"
-            } else {
-                "normal"
-            };
-            dispatch_context.set("mouse_format", format);
-        };
-        dispatch_context
-    }
+    vec![terminal_subscription, terminal_events_subscription]
 }
 
 fn possible_open_paths_metadata(
@@ -665,6 +676,19 @@ fn possible_open_targets(
     possible_open_paths_metadata(fs, row, column, potential_abs_paths, cx)
 }
 
+fn regex_to_literal(regex: &str) -> String {
+    regex
+        .chars()
+        .flat_map(|c| {
+            if REGEX_SPECIAL_CHARS.contains(&c) {
+                vec!['\\', c]
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
 pub fn regex_search_for_query(query: &project::search::SearchQuery) -> Option<RegexSearch> {
     let query = query.as_str();
     if query == "." {
@@ -676,7 +700,7 @@ pub fn regex_search_for_query(query: &project::search::SearchQuery) -> Option<Re
 
 impl TerminalView {
     fn key_down(&mut self, event: &KeyDownEvent, cx: &mut ViewContext<Self>) {
-        self.clear_bel(cx);
+        self.clear_bell(cx);
         self.pause_cursor_blinking(cx);
 
         self.terminal.update(cx, |term, cx| {
@@ -688,7 +712,6 @@ impl TerminalView {
     }
 
     fn focus_in(&mut self, cx: &mut ViewContext<Self>) {
-        self.has_new_content = false;
         self.terminal.read(cx).focus_in();
         self.blink_cursors(self.blink_epoch, cx);
         cx.notify();
@@ -742,10 +765,13 @@ impl Render for TerminalView {
                 )),
             )
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
-                overlay()
-                    .position(*position)
-                    .anchor(gpui::AnchorCorner::TopLeft)
-                    .child(menu.clone())
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(gpui::AnchorCorner::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
             }))
     }
 }
@@ -757,17 +783,27 @@ impl Item for TerminalView {
         Some(self.terminal().read(cx).title(false).into())
     }
 
-    fn tab_content(
-        &self,
-        _detail: Option<usize>,
-        selected: bool,
-        cx: &WindowContext,
-    ) -> AnyElement {
-        let title = self.terminal().read(cx).title(true);
+    fn tab_content(&self, params: TabContentParams, cx: &WindowContext) -> AnyElement {
+        let terminal = self.terminal().read(cx);
+        let title = terminal.title(true);
+        let icon = match terminal.task() {
+            Some(terminal_task) => match &terminal_task.status {
+                TaskStatus::Unknown => IconName::ExclamationTriangle,
+                TaskStatus::Running => IconName::Play,
+                TaskStatus::Completed { success } => {
+                    if *success {
+                        IconName::Check
+                    } else {
+                        IconName::XCircle
+                    }
+                }
+            },
+            None => IconName::Terminal,
+        };
         h_flex()
             .gap_2()
-            .child(Icon::new(IconName::Terminal))
-            .child(Label::new(title).color(if selected {
+            .child(Icon::new(icon))
+            .child(Label::new(title).color(if params.selected {
                 Color::Default
             } else {
                 Color::Muted
@@ -798,8 +834,11 @@ impl Item for TerminalView {
         None
     }
 
-    fn is_dirty(&self, _cx: &gpui::AppContext) -> bool {
-        self.has_bell()
+    fn is_dirty(&self, cx: &gpui::AppContext) -> bool {
+        match self.terminal.read(cx).task() {
+            Some(task) => task.status == TaskStatus::Running,
+            None => self.has_bell(),
+        }
     }
 
     fn has_conflict(&self, _cx: &AppContext) -> bool {
@@ -811,13 +850,18 @@ impl Item for TerminalView {
     }
 
     fn breadcrumb_location(&self) -> ToolbarItemLocation {
-        ToolbarItemLocation::PrimaryLeft
+        if self.show_title {
+            ToolbarItemLocation::PrimaryLeft
+        } else {
+            ToolbarItemLocation::Hidden
+        }
     }
 
     fn breadcrumbs(&self, _: &theme::Theme, cx: &AppContext) -> Option<Vec<BreadcrumbText>> {
         Some(vec![BreadcrumbText {
             text: self.terminal().read(cx).breadcrumb_text.clone(),
             highlights: None,
+            font: None,
         }])
     }
 
@@ -841,19 +885,17 @@ impl Item for TerminalView {
                 .or_else(|| {
                     cx.update(|cx| {
                         let strategy = TerminalSettings::get_global(cx).working_directory.clone();
-                        workspace
-                            .upgrade()
-                            .map(|workspace| {
-                                get_working_directory(workspace.read(cx), cx, strategy)
-                            })
-                            .flatten()
+                        workspace.upgrade().and_then(|workspace| {
+                            get_working_directory(workspace.read(cx), cx, strategy)
+                        })
                     })
                     .ok()
                     .flatten()
-                });
+                })
+                .filter(|cwd| !cwd.as_os_str().is_empty());
 
             let terminal = project.update(&mut cx, |project, cx| {
-                project.create_terminal(cwd, window, cx)
+                project.create_terminal(cwd, None, window, cx)
             })??;
             pane.update(&mut cx, |_, cx| {
                 cx.new_view(|cx| TerminalView::new(terminal, workspace, workspace_id, cx))
@@ -862,14 +904,16 @@ impl Item for TerminalView {
     }
 
     fn added_to_workspace(&mut self, workspace: &mut Workspace, cx: &mut ViewContext<Self>) {
-        cx.background_executor()
-            .spawn(TERMINAL_DB.update_workspace_id(
-                workspace.database_id(),
-                self.workspace_id,
-                cx.entity_id().as_u64(),
-            ))
-            .detach();
-        self.workspace_id = workspace.database_id();
+        if self.terminal().read(cx).task().is_none() {
+            cx.background_executor()
+                .spawn(TERMINAL_DB.update_workspace_id(
+                    workspace.database_id(),
+                    self.workspace_id,
+                    cx.entity_id().as_u64(),
+                ))
+                .detach();
+            self.workspace_id = workspace.database_id();
+        }
     }
 
     fn to_item_events(event: &Self::Event, mut f: impl FnMut(ItemEvent)) {
@@ -884,7 +928,7 @@ impl SearchableItem for TerminalView {
         SearchOptions {
             case: false,
             word: false,
-            regex: false,
+            regex: true,
             replacement: false,
         }
     }
@@ -895,8 +939,9 @@ impl SearchableItem for TerminalView {
     }
 
     /// Store matches returned from find_matches somewhere for rendering
-    fn update_matches(&mut self, matches: Vec<Self::Match>, cx: &mut ViewContext<Self>) {
-        self.terminal().update(cx, |term, _| term.matches = matches)
+    fn update_matches(&mut self, matches: &[Self::Match], cx: &mut ViewContext<Self>) {
+        self.terminal()
+            .update(cx, |term, _| term.matches = matches.to_vec())
     }
 
     /// Returns the selection content to pre-load into this search
@@ -910,14 +955,14 @@ impl SearchableItem for TerminalView {
     }
 
     /// Focus match at given index into the Vec of matches
-    fn activate_match(&mut self, index: usize, _: Vec<Self::Match>, cx: &mut ViewContext<Self>) {
+    fn activate_match(&mut self, index: usize, _: &[Self::Match], cx: &mut ViewContext<Self>) {
         self.terminal()
             .update(cx, |term, _| term.activate_match(index));
         cx.notify();
     }
 
     /// Add selections for all matches given.
-    fn select_matches(&mut self, matches: Vec<Self::Match>, cx: &mut ViewContext<Self>) {
+    fn select_matches(&mut self, matches: &[Self::Match], cx: &mut ViewContext<Self>) {
         self.terminal()
             .update(cx, |term, _| term.select_matches(matches));
         cx.notify();
@@ -926,12 +971,27 @@ impl SearchableItem for TerminalView {
     /// Get all of the matches for this query, should be done on the background
     fn find_matches(
         &mut self,
-        query: Arc<project::search::SearchQuery>,
+        query: Arc<SearchQuery>,
         cx: &mut ViewContext<Self>,
     ) -> Task<Vec<Self::Match>> {
-        if let Some(searcher) = regex_search_for_query(&query) {
+        let searcher = match &*query {
+            SearchQuery::Text { .. } => regex_search_for_query(
+                &(SearchQuery::text(
+                    regex_to_literal(&query.as_str()),
+                    query.whole_word(),
+                    query.case_sensitive(),
+                    query.include_ignored(),
+                    query.files_to_include().to_vec(),
+                    query.files_to_exclude().to_vec(),
+                )
+                .unwrap()),
+            ),
+            SearchQuery::Regex { .. } => regex_search_for_query(&query),
+        };
+
+        if let Some(s) = searcher {
             self.terminal()
-                .update(cx, |term, cx| term.find_matches(searcher, cx))
+                .update(cx, |term, cx| term.find_matches(s, cx))
         } else {
             Task::ready(vec![])
         }
@@ -940,7 +1000,7 @@ impl SearchableItem for TerminalView {
     /// Reports back to the search toolbar what the active match should be (the selection)
     fn active_match_index(
         &mut self,
-        matches: Vec<Self::Match>,
+        matches: &[Self::Match],
         cx: &mut ViewContext<Self>,
     ) -> Option<usize> {
         // Selection head might have a value if there's a selection that isn't
@@ -1221,5 +1281,15 @@ mod tests {
             };
             project.update(cx, |project, cx| project.set_active_path(Some(p), cx));
         });
+    }
+
+    #[test]
+    fn escapes_only_special_characters() {
+        assert_eq!(regex_to_literal(r"test(\w)"), r"test\(\\w\)".to_string());
+    }
+
+    #[test]
+    fn empty_string_stays_empty() {
+        assert_eq!(regex_to_literal(""), "".to_string());
     }
 }

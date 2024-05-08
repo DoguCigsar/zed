@@ -1,16 +1,21 @@
 #[cfg(test)]
 mod file_finder_tests;
 
+mod new_path_prompt;
+
 use collections::{HashMap, HashSet};
 use editor::{scroll::Autoscroll, Bias, Editor};
 use fuzzy::{CharBag, PathMatch, PathMatchCandidate};
 use gpui::{
-    actions, rems, AppContext, DismissEvent, EventEmitter, FocusHandle, FocusableView, Model,
-    ParentElement, Render, Styled, Task, View, ViewContext, VisualContext, WeakView,
+    actions, rems, Action, AppContext, DismissEvent, EventEmitter, FocusHandle, FocusableView,
+    Model, Modifiers, ModifiersChangedEvent, ParentElement, Render, Styled, Task, View,
+    ViewContext, VisualContext, WeakView,
 };
 use itertools::Itertools;
+use new_path_prompt::NewPathPrompt;
 use picker::{Picker, PickerDelegate};
 use project::{PathMatchCandidateSet, Project, ProjectPath, WorktreeId};
+use settings::Settings;
 use std::{
     cmp,
     path::{Path, PathBuf},
@@ -22,18 +27,20 @@ use std::{
 use text::Point;
 use ui::{prelude::*, HighlightedLabel, ListItem, ListItemSpacing};
 use util::{paths::PathLikeWithPosition, post_inc, ResultExt};
-use workspace::{ModalView, Workspace};
+use workspace::{item::PreviewTabsSettings, ModalView, Workspace};
 
-actions!(file_finder, [Toggle]);
+actions!(file_finder, [Toggle, SelectPrev]);
 
 impl ModalView for FileFinder {}
 
 pub struct FileFinder {
     picker: View<Picker<FileFinderDelegate>>,
+    init_modifiers: Option<Modifiers>,
 }
 
 pub fn init(cx: &mut AppContext) {
     cx.observe_new_views(FileFinder::register).detach();
+    cx.observe_new_views(NewPathPrompt::register).detach();
 }
 
 impl FileFinder {
@@ -45,9 +52,10 @@ impl FileFinder {
             };
 
             file_finder.update(cx, |file_finder, cx| {
-                file_finder
-                    .picker
-                    .update(cx, |picker, cx| picker.cycle_selection(cx))
+                file_finder.init_modifiers = Some(cx.modifiers());
+                file_finder.picker.update(cx, |picker, cx| {
+                    picker.cycle_selection(cx);
+                });
             });
         });
     }
@@ -93,8 +101,30 @@ impl FileFinder {
 
     fn new(delegate: FileFinderDelegate, cx: &mut ViewContext<Self>) -> Self {
         Self {
-            picker: cx.new_view(|cx| Picker::new(delegate, cx)),
+            picker: cx.new_view(|cx| Picker::uniform_list(delegate, cx)),
+            init_modifiers: cx.modifiers().modified().then_some(cx.modifiers()),
         }
+    }
+
+    fn handle_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        cx: &mut ViewContext<Self>,
+    ) {
+        let Some(init_modifiers) = self.init_modifiers.take() else {
+            return;
+        };
+        if self.picker.read(cx).delegate.has_changed_selected_index {
+            if !event.modified() || !init_modifiers.is_subset_of(&event) {
+                self.init_modifiers = None;
+                cx.dispatch_action(menu::Confirm.boxed_clone());
+            }
+        }
+    }
+
+    fn handle_select_prev(&mut self, _: &SelectPrev, cx: &mut ViewContext<Self>) {
+        self.init_modifiers = Some(cx.modifiers());
+        cx.dispatch_action(Box::new(menu::SelectPrev));
     }
 }
 
@@ -107,8 +137,13 @@ impl FocusableView for FileFinder {
 }
 
 impl Render for FileFinder {
-    fn render(&mut self, _cx: &mut ViewContext<Self>) -> impl IntoElement {
-        v_flex().w(rems(34.)).child(self.picker.clone())
+    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("FileFinder")
+            .w(rems(34.))
+            .on_modifiers_changed(cx.listener(Self::handle_modifiers_changed))
+            .on_action(cx.listener(Self::handle_select_prev))
+            .child(self.picker.clone())
     }
 }
 
@@ -123,6 +158,7 @@ pub struct FileFinderDelegate {
     currently_opened_path: Option<FoundPath>,
     matches: Matches,
     selected_index: usize,
+    has_changed_selected_index: bool,
     cancel_flag: Arc<AtomicBool>,
     history_items: Vec<FoundPath>,
 }
@@ -365,14 +401,7 @@ impl FileFinderDelegate {
         history_items: Vec<FoundPath>,
         cx: &mut ViewContext<FileFinder>,
     ) -> Self {
-        cx.observe(&project, |file_finder, _, cx| {
-            //todo We should probably not re-render on every project anything
-            file_finder
-                .picker
-                .update(cx, |picker, cx| picker.refresh(cx))
-        })
-        .detach();
-
+        Self::subscribe_to_updates(&project, cx);
         Self {
             file_finder,
             workspace,
@@ -383,10 +412,25 @@ impl FileFinderDelegate {
             latest_search_query: None,
             currently_opened_path,
             matches: Matches::default(),
+            has_changed_selected_index: false,
             selected_index: 0,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             history_items,
         }
+    }
+
+    fn subscribe_to_updates(project: &Model<Project>, cx: &mut ViewContext<FileFinder>) {
+        cx.subscribe(project, |file_finder, _, event, cx| {
+            match event {
+                project::Event::WorktreeUpdatedEntries(_, _)
+                | project::Event::WorktreeAdded
+                | project::Event::WorktreeRemoved(_) => file_finder
+                    .picker
+                    .update(cx, |picker, cx| picker.refresh(cx)),
+                _ => {}
+            };
+        })
+        .detach();
     }
 
     fn spawn_search(
@@ -414,6 +458,7 @@ impl FileFinderDelegate {
                         .root_entry()
                         .map_or(false, |entry| entry.is_ignored),
                     include_root_name,
+                    directories_only: false,
                 }
             })
             .collect::<Vec<_>>();
@@ -663,7 +708,7 @@ impl FileFinderDelegate {
 impl PickerDelegate for FileFinderDelegate {
     type ListItem = ListItem;
 
-    fn placeholder_text(&self) -> Arc<str> {
+    fn placeholder_text(&self, _cx: &mut WindowContext) -> Arc<str> {
         "Search project files...".into()
     }
 
@@ -676,6 +721,7 @@ impl PickerDelegate for FileFinderDelegate {
     }
 
     fn set_selected_index(&mut self, ix: usize, cx: &mut ViewContext<Picker<Self>>) {
+        self.has_changed_selected_index = true;
         self.selected_index = ix;
         cx.notify();
     }
@@ -694,7 +740,7 @@ impl PickerDelegate for FileFinderDelegate {
         raw_query: String,
         cx: &mut ViewContext<Picker<Self>>,
     ) -> Task<()> {
-        let raw_query = raw_query.replace(" ", "");
+        let raw_query = raw_query.replace(' ', "");
         let raw_query = raw_query.trim();
         if raw_query.is_empty() {
             let project = self.project.read(cx);
@@ -714,7 +760,7 @@ impl PickerDelegate for FileFinderDelegate {
                 }),
             );
 
-            self.selected_index = self.calculate_selected_index();
+            self.selected_index = 0;
             cx.notify();
             Task::ready(())
         } else {
@@ -742,13 +788,24 @@ impl PickerDelegate for FileFinderDelegate {
         if let Some(m) = self.matches.get(self.selected_index()) {
             if let Some(workspace) = self.workspace.upgrade() {
                 let open_task = workspace.update(cx, move |workspace, cx| {
-                    let split_or_open = |workspace: &mut Workspace, project_path, cx| {
-                        if secondary {
-                            workspace.split_path(project_path, cx)
-                        } else {
-                            workspace.open_path(project_path, None, true, cx)
-                        }
-                    };
+                    let split_or_open =
+                        |workspace: &mut Workspace,
+                         project_path,
+                         cx: &mut ViewContext<Workspace>| {
+                            let allow_preview =
+                                PreviewTabsSettings::get_global(cx).enable_preview_from_file_finder;
+                            if secondary {
+                                workspace.split_path_preview(project_path, allow_preview, cx)
+                            } else {
+                                workspace.open_path_preview(
+                                    project_path,
+                                    None,
+                                    true,
+                                    allow_preview,
+                                    cx,
+                                )
+                            }
+                        };
                     match m {
                         Match::History(history_match, _) => {
                             let worktree_id = history_match.project.worktree_id;
@@ -873,6 +930,7 @@ impl PickerDelegate for FileFinderDelegate {
                 .child(
                     h_flex()
                         .gap_2()
+                        .py_px()
                         .child(HighlightedLabel::new(file_name, file_name_positions))
                         .child(
                             HighlightedLabel::new(full_path, full_path_positions)

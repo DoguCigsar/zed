@@ -8,40 +8,84 @@ use serde::{Deserialize, Serialize};
 
 lazy_static::lazy_static! {
     pub static ref HOME: PathBuf = dirs::home_dir().expect("failed to determine home directory");
-    pub static ref CONFIG_DIR: PathBuf = HOME.join(".config").join("zed");
-    pub static ref CONVERSATIONS_DIR: PathBuf = HOME.join(".config/zed/conversations");
-    pub static ref EMBEDDINGS_DIR: PathBuf = HOME.join(".config/zed/embeddings");
-    pub static ref THEMES_DIR: PathBuf = HOME.join(".config/zed/themes");
-    pub static ref LOGS_DIR: PathBuf = HOME.join("Library/Logs/Zed");
-    pub static ref SUPPORT_DIR: PathBuf = HOME.join("Library/Application Support/Zed");
-    pub static ref PLUGINS_DIR: PathBuf = HOME.join("Library/Application Support/Zed/plugins");
-    pub static ref LANGUAGES_DIR: PathBuf = HOME.join("Library/Application Support/Zed/languages");
-    pub static ref COPILOT_DIR: PathBuf = HOME.join("Library/Application Support/Zed/copilot");
-    pub static ref DEFAULT_PRETTIER_DIR: PathBuf = HOME.join("Library/Application Support/Zed/prettier");
-    pub static ref DB_DIR: PathBuf = HOME.join("Library/Application Support/Zed/db");
-    pub static ref CRASHES_DIR: PathBuf = HOME.join("Library/Logs/DiagnosticReports");
-    pub static ref CRASHES_RETIRED_DIR: PathBuf = HOME.join("Library/Logs/DiagnosticReports/Retired");
+    pub static ref CONFIG_DIR: PathBuf = if cfg!(target_os = "windows") {
+        dirs::config_dir()
+            .expect("failed to determine RoamingAppData directory")
+            .join("Zed")
+    } else if cfg!(target_os = "linux") {
+        dirs::config_dir()
+            .expect("failed to determine XDG_CONFIG_HOME directory")
+            .join("zed")
+    } else {
+        HOME.join(".config").join("zed")
+    };
+    pub static ref CONVERSATIONS_DIR: PathBuf = if cfg!(target_os = "macos") {
+        CONFIG_DIR.join("conversations")
+    } else {
+        SUPPORT_DIR.join("conversations")
+    };
+    pub static ref EMBEDDINGS_DIR: PathBuf = if cfg!(target_os = "macos") {
+        CONFIG_DIR.join("embeddings")
+    } else {
+        SUPPORT_DIR.join("embeddings")
+    };
+    pub static ref THEMES_DIR: PathBuf = CONFIG_DIR.join("themes");
+
+    pub static ref SUPPORT_DIR: PathBuf = if cfg!(target_os = "macos") {
+        HOME.join("Library/Application Support/Zed")
+    } else if cfg!(target_os = "linux") {
+        dirs::data_local_dir()
+            .expect("failed to determine XDG_DATA_DIR directory")
+            .join("zed")
+    } else if cfg!(target_os = "windows") {
+        dirs::data_local_dir()
+            .expect("failed to determine LocalAppData directory")
+            .join("Zed")
+    } else {
+        CONFIG_DIR.clone()
+    };
+    pub static ref LOGS_DIR: PathBuf = if cfg!(target_os = "macos") {
+        HOME.join("Library/Logs/Zed")
+    } else {
+        SUPPORT_DIR.join("logs")
+    };
+    pub static ref EXTENSIONS_DIR: PathBuf = SUPPORT_DIR.join("extensions");
+    pub static ref LANGUAGES_DIR: PathBuf = SUPPORT_DIR.join("languages");
+    pub static ref COPILOT_DIR: PathBuf = SUPPORT_DIR.join("copilot");
+    pub static ref SUPERMAVEN_DIR: PathBuf = SUPPORT_DIR.join("supermaven");
+    pub static ref DEFAULT_PRETTIER_DIR: PathBuf = SUPPORT_DIR.join("prettier");
+    pub static ref DB_DIR: PathBuf = SUPPORT_DIR.join("db");
+    pub static ref CRASHES_DIR: Option<PathBuf> = cfg!(target_os = "macos")
+        .then_some(HOME.join("Library/Logs/DiagnosticReports"));
+    pub static ref CRASHES_RETIRED_DIR: Option<PathBuf> = CRASHES_DIR
+        .as_ref()
+        .map(|dir| dir.join("Retired"));
+
     pub static ref SETTINGS: PathBuf = CONFIG_DIR.join("settings.json");
     pub static ref KEYMAP: PathBuf = CONFIG_DIR.join("keymap.json");
+    pub static ref TASKS: PathBuf = CONFIG_DIR.join("tasks.json");
     pub static ref LAST_USERNAME: PathBuf = CONFIG_DIR.join("last-username.txt");
     pub static ref LOG: PathBuf = LOGS_DIR.join("Zed.log");
     pub static ref OLD_LOG: PathBuf = LOGS_DIR.join("Zed.log.old");
     pub static ref LOCAL_SETTINGS_RELATIVE_PATH: &'static Path = Path::new(".zed/settings.json");
-}
-
-pub mod legacy {
-    use std::path::PathBuf;
-
-    lazy_static::lazy_static! {
-        static ref CONFIG_DIR: PathBuf = super::HOME.join(".zed");
-        pub static ref SETTINGS: PathBuf = CONFIG_DIR.join("settings.json");
-        pub static ref KEYMAP: PathBuf = CONFIG_DIR.join("keymap.json");
-    }
+    pub static ref LOCAL_TASKS_RELATIVE_PATH: &'static Path = Path::new(".zed/tasks.json");
+    pub static ref LOCAL_VSCODE_TASKS_RELATIVE_PATH: &'static Path = Path::new(".vscode/tasks.json");
+    pub static ref TEMP_DIR: PathBuf = if cfg!(target_os = "windows") {
+        dirs::cache_dir()
+            .expect("failed to determine LocalAppData directory")
+            .join("Zed")
+    } else if cfg!(target_os = "linux") {
+        dirs::cache_dir()
+            .expect("failed to determine XDG_CACHE_HOME directory")
+            .join("zed")
+    } else {
+        HOME.join(".cache").join("zed")
+    };
 }
 
 pub trait PathExt {
     fn compact(&self) -> PathBuf;
-    fn icon_suffix(&self) -> Option<&str>;
+    fn icon_stem_or_suffix(&self) -> Option<&str>;
     fn extension_or_hidden_file_name(&self) -> Option<&str>;
     fn try_from_bytes<'a>(bytes: &'a [u8]) -> anyhow::Result<Self>
     where
@@ -93,17 +137,17 @@ impl<T: AsRef<Path>> PathExt for T {
         }
     }
 
-    /// Returns a suffix of the path that is used to determine which file icon to use
-    fn icon_suffix(&self) -> Option<&str> {
-        let file_name = self.as_ref().file_name()?.to_str()?;
-
+    /// Returns either the suffix if available, or the file stem otherwise to determine which file icon to use
+    fn icon_stem_or_suffix(&self) -> Option<&str> {
+        let path = self.as_ref();
+        let file_name = path.file_name()?.to_str()?;
         if file_name.starts_with('.') {
             return file_name.strip_prefix('.');
         }
 
-        self.as_ref()
-            .extension()
-            .and_then(|extension| extension.to_str())
+        path.extension()
+            .and_then(|e| e.to_str())
+            .or_else(|| path.file_stem()?.to_str())
     }
 
     /// Returns a file's extension or, if the file is hidden, its name without the leading dot
@@ -145,7 +189,17 @@ impl<P> PathLikeWithPosition<P> {
             })
         };
 
-        match s.trim().split_once(FILE_ROW_COLUMN_DELIMITER) {
+        let trimmed = s.trim();
+
+        #[cfg(target_os = "windows")]
+        {
+            let is_absolute = trimmed.starts_with(r"\\?\");
+            if is_absolute {
+                return Self::parse_absolute_path(trimmed, parse_path_like_str);
+            }
+        }
+
+        match trimmed.split_once(FILE_ROW_COLUMN_DELIMITER) {
             Some((path_like_str, maybe_row_and_col_str)) => {
                 let path_like_str = path_like_str.trim();
                 let maybe_row_and_col_str = maybe_row_and_col_str.trim();
@@ -171,28 +225,84 @@ impl<P> PathLikeWithPosition<P> {
                                     column: None,
                                 })
                             } else {
-                                let maybe_col_str =
-                                    if maybe_col_str.ends_with(FILE_ROW_COLUMN_DELIMITER) {
-                                        &maybe_col_str[..maybe_col_str.len() - 1]
-                                    } else {
-                                        maybe_col_str
-                                    };
+                                let (maybe_col_str, _) =
+                                    maybe_col_str.split_once(':').unwrap_or((maybe_col_str, ""));
                                 match maybe_col_str.parse::<u32>() {
                                     Ok(col) => Ok(Self {
                                         path_like: parse_path_like_str(path_like_str)?,
                                         row: Some(row),
                                         column: Some(col),
                                     }),
-                                    Err(_) => fallback(s),
+                                    Err(_) => Ok(Self {
+                                        path_like: parse_path_like_str(path_like_str)?,
+                                        row: Some(row),
+                                        column: None,
+                                    }),
                                 }
                             }
                         }
-                        Err(_) => fallback(s),
+                        Err(_) => Ok(Self {
+                            path_like: parse_path_like_str(path_like_str)?,
+                            row: None,
+                            column: None,
+                        }),
                     }
                 }
             }
             None => fallback(s),
         }
+    }
+
+    /// This helper function is used for parsing absolute paths on Windows. It exists because absolute paths on Windows are quite different from other platforms. See [this page](https://learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats#dos-device-paths) for more information.
+    #[cfg(target_os = "windows")]
+    fn parse_absolute_path<E>(
+        s: &str,
+        parse_path_like_str: impl Fn(&str) -> Result<P, E>,
+    ) -> Result<Self, E> {
+        let fallback = |fallback_str| {
+            Ok(Self {
+                path_like: parse_path_like_str(fallback_str)?,
+                row: None,
+                column: None,
+            })
+        };
+
+        let mut iterator = s.split(FILE_ROW_COLUMN_DELIMITER);
+
+        let drive_prefix = iterator.next().unwrap_or_default();
+        let file_path = iterator.next().unwrap_or_default();
+
+        // TODO: How to handle drives without a letter? UNC paths?
+        let complete_path = drive_prefix.replace("\\\\?\\", "") + ":" + &file_path;
+
+        if let Some(row_str) = iterator.next() {
+            if let Some(column_str) = iterator.next() {
+                match row_str.parse::<u32>() {
+                    Ok(row) => match column_str.parse::<u32>() {
+                        Ok(col) => {
+                            return Ok(Self {
+                                path_like: parse_path_like_str(&complete_path)?,
+                                row: Some(row),
+                                column: Some(col),
+                            });
+                        }
+
+                        Err(_) => {
+                            return Ok(Self {
+                                path_like: parse_path_like_str(&complete_path)?,
+                                row: Some(row),
+                                column: None,
+                            });
+                        }
+                    },
+
+                    Err(_) => {
+                        return fallback(&complete_path);
+                    }
+                }
+            }
+        }
+        return fallback(&complete_path);
     }
 
     pub fn map_path_like<P2, E>(
@@ -318,23 +428,23 @@ mod tests {
 
     #[test]
     fn path_with_position_parsing_negative() {
-        for input in [
-            "test_file.rs:a",
-            "test_file.rs:a:b",
-            "test_file.rs::",
-            "test_file.rs::1",
-            "test_file.rs:1::",
-            "test_file.rs::1:2",
-            "test_file.rs:1::2",
-            "test_file.rs:1:2:3",
+        for (input, row, column) in [
+            ("test_file.rs:a", None, None),
+            ("test_file.rs:a:b", None, None),
+            ("test_file.rs::", None, None),
+            ("test_file.rs::1", None, None),
+            ("test_file.rs:1::", Some(1), None),
+            ("test_file.rs::1:2", None, None),
+            ("test_file.rs:1::2", Some(1), None),
+            ("test_file.rs:1:2:3", Some(1), Some(2)),
         ] {
             let actual = parse_str(input);
             assert_eq!(
                 actual,
                 PathLikeWithPosition {
-                    path_like: input.to_string(),
-                    row: None,
-                    column: None,
+                    path_like: "test_file.rs".to_string(),
+                    row,
+                    column,
                 },
                 "For negative case input str '{input}', got a parse mismatch"
             );
@@ -344,6 +454,7 @@ mod tests {
     // Trim off trailing `:`s for otherwise valid input.
     #[test]
     fn path_with_position_parsing_special() {
+        #[cfg(not(target_os = "windows"))]
         let input_and_expected = [
             (
                 "test_file.rs:",
@@ -367,6 +478,50 @@ mod tests {
                     path_like: "crates/file_finder/src/file_finder.rs".to_string(),
                     row: Some(1902),
                     column: Some(13),
+                },
+            ),
+        ];
+
+        #[cfg(target_os = "windows")]
+        let input_and_expected = [
+            (
+                "test_file.rs:",
+                PathLikeWithPosition {
+                    path_like: "test_file.rs".to_string(),
+                    row: None,
+                    column: None,
+                },
+            ),
+            (
+                "test_file.rs:1:",
+                PathLikeWithPosition {
+                    path_like: "test_file.rs".to_string(),
+                    row: Some(1),
+                    column: None,
+                },
+            ),
+            (
+                "\\\\?\\C:\\Users\\someone\\test_file.rs:1902:13:",
+                PathLikeWithPosition {
+                    path_like: "C:\\Users\\someone\\test_file.rs".to_string(),
+                    row: Some(1902),
+                    column: Some(13),
+                },
+            ),
+            (
+                "\\\\?\\C:\\Users\\someone\\test_file.rs:1902:13:15:",
+                PathLikeWithPosition {
+                    path_like: "C:\\Users\\someone\\test_file.rs".to_string(),
+                    row: Some(1902),
+                    column: Some(13),
+                },
+            ),
+            (
+                "\\\\?\\C:\\Users\\someone\\test_file.rs:1902:::15:",
+                PathLikeWithPosition {
+                    path_like: "C:\\Users\\someone\\test_file.rs".to_string(),
+                    row: Some(1902),
+                    column: None,
                 },
             ),
         ];
@@ -396,26 +551,30 @@ mod tests {
     }
 
     #[test]
-    fn test_icon_suffix() {
+    fn test_icon_stem_or_suffix() {
         // No dots in name
         let path = Path::new("/a/b/c/file_name.rs");
-        assert_eq!(path.icon_suffix(), Some("rs"));
+        assert_eq!(path.icon_stem_or_suffix(), Some("rs"));
 
         // Single dot in name
         let path = Path::new("/a/b/c/file.name.rs");
-        assert_eq!(path.icon_suffix(), Some("rs"));
+        assert_eq!(path.icon_stem_or_suffix(), Some("rs"));
+
+        // No suffix
+        let path = Path::new("/a/b/c/file");
+        assert_eq!(path.icon_stem_or_suffix(), Some("file"));
 
         // Multiple dots in name
         let path = Path::new("/a/b/c/long.file.name.rs");
-        assert_eq!(path.icon_suffix(), Some("rs"));
+        assert_eq!(path.icon_stem_or_suffix(), Some("rs"));
 
         // Hidden file, no extension
         let path = Path::new("/a/b/c/.gitignore");
-        assert_eq!(path.icon_suffix(), Some("gitignore"));
+        assert_eq!(path.icon_stem_or_suffix(), Some("gitignore"));
 
         // Hidden file, with extension
         let path = Path::new("/a/b/c/.eslintrc.js");
-        assert_eq!(path.icon_suffix(), Some("eslintrc.js"));
+        assert_eq!(path.icon_stem_or_suffix(), Some("eslintrc.js"));
     }
 
     #[test]
@@ -446,7 +605,7 @@ mod tests {
         let path = Path::new("/work/node_modules");
         let path_matcher = PathMatcher::new("**/node_modules/**").unwrap();
         assert!(
-            path_matcher.is_match(&path),
+            path_matcher.is_match(path),
             "Path matcher {path_matcher} should match {path:?}"
         );
     }
@@ -456,7 +615,7 @@ mod tests {
         let path = Path::new("/Users/someonetoignore/work/zed/zed.dev/node_modules");
         let path_matcher = PathMatcher::new("**/node_modules/**").unwrap();
         assert!(
-            path_matcher.is_match(&path),
+            path_matcher.is_match(path),
             "Path matcher {path_matcher} should match {path:?}"
         );
     }

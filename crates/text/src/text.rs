@@ -71,12 +71,19 @@ impl Display for BufferId {
     }
 }
 
+impl From<NonZeroU64> for BufferId {
+    fn from(id: NonZeroU64) -> Self {
+        BufferId(id)
+    }
+}
+
 impl BufferId {
     /// Returns Err if `id` is outside of BufferId domain.
     pub fn new(id: u64) -> anyhow::Result<Self> {
         let id = NonZeroU64::new(id).context("Buffer id cannot be 0.")?;
         Ok(Self(id))
     }
+
     /// Increments this buffer id, returning the old value.
     /// So that's a post-increment operator in disguise.
     pub fn next(&mut self) -> Self {
@@ -513,8 +520,16 @@ impl Buffer {
     pub fn new(replica_id: u16, remote_id: BufferId, mut base_text: String) -> Buffer {
         let line_ending = LineEnding::detect(&base_text);
         LineEnding::normalize(&mut base_text);
+        Self::new_normalized(replica_id, remote_id, line_ending, Rope::from(base_text))
+    }
 
-        let history = History::new(Rope::from(base_text.as_ref()));
+    pub fn new_normalized(
+        replica_id: u16,
+        remote_id: BufferId,
+        line_ending: LineEnding,
+        normalized: Rope,
+    ) -> Buffer {
+        let history = History::new(normalized);
         let mut fragments = SumTree::new();
         let mut insertions = SumTree::new();
 
@@ -1622,6 +1637,49 @@ impl BufferSnapshot {
         &self.visible_text
     }
 
+    pub fn rope_for_version(&self, version: &clock::Global) -> Rope {
+        let mut rope = Rope::new();
+
+        let mut cursor = self
+            .fragments
+            .filter::<_, FragmentTextSummary>(move |summary| {
+                !version.observed_all(&summary.max_version)
+            });
+        cursor.next(&None);
+
+        let mut visible_cursor = self.visible_text.cursor(0);
+        let mut deleted_cursor = self.deleted_text.cursor(0);
+
+        while let Some(fragment) = cursor.item() {
+            if cursor.start().visible > visible_cursor.offset() {
+                let text = visible_cursor.slice(cursor.start().visible);
+                rope.append(text);
+            }
+
+            if fragment.was_visible(version, &self.undo_map) {
+                if fragment.visible {
+                    let text = visible_cursor.slice(cursor.end(&None).visible);
+                    rope.append(text);
+                } else {
+                    deleted_cursor.seek_forward(cursor.start().deleted);
+                    let text = deleted_cursor.slice(cursor.end(&None).deleted);
+                    rope.append(text);
+                }
+            } else if fragment.visible {
+                visible_cursor.seek_forward(cursor.end(&None).visible);
+            }
+
+            cursor.next(&None);
+        }
+
+        if cursor.start().visible > visible_cursor.offset() {
+            let text = visible_cursor.slice(cursor.start().visible);
+            rope.append(text);
+        }
+
+        rope
+    }
+
     pub fn remote_id(&self) -> BufferId {
         self.remote_id
     }
@@ -1911,8 +1969,16 @@ impl BufferSnapshot {
             } else {
                 insertion_cursor.prev(&());
             }
-            let insertion = insertion_cursor.item().expect("invalid insertion");
-            assert_eq!(insertion.timestamp, anchor.timestamp, "invalid insertion");
+
+            let Some(insertion) = insertion_cursor
+                .item()
+                .filter(|insertion| insertion.timestamp == anchor.timestamp)
+            else {
+                panic!(
+                    "invalid anchor {:?}. buffer id: {}, version: {:?}",
+                    anchor, self.remote_id, self.version
+                );
+            };
 
             let mut fragment_cursor = self.fragments.cursor::<(Option<&Locator>, usize)>();
             fragment_cursor.seek(&Some(&insertion.fragment_id), Bias::Left, &None);
@@ -1949,8 +2015,20 @@ impl BufferSnapshot {
             } else {
                 insertion_cursor.prev(&());
             }
-            let insertion = insertion_cursor.item().expect("invalid insertion");
-            debug_assert_eq!(insertion.timestamp, anchor.timestamp, "invalid insertion");
+
+            let Some(insertion) = insertion_cursor.item().filter(|insertion| {
+                if cfg!(debug_assertions) {
+                    insertion.timestamp == anchor.timestamp
+                } else {
+                    true
+                }
+            }) else {
+                panic!(
+                    "invalid anchor {:?}. buffer id: {}, version: {:?}",
+                    anchor, self.remote_id, self.version
+                );
+            };
+
             &insertion.fragment_id
         }
     }

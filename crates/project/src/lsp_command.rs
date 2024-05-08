@@ -1,7 +1,7 @@
 use crate::{
-    DocumentHighlight, Hover, HoverBlock, HoverBlockKind, InlayHint, InlayHintLabel,
-    InlayHintLabelPart, InlayHintLabelPartTooltip, InlayHintTooltip, Location, LocationLink,
-    MarkupContent, Project, ProjectTransaction, ResolveState,
+    CodeAction, CoreCompletion, DocumentHighlight, Hover, HoverBlock, HoverBlockKind, InlayHint,
+    InlayHintLabel, InlayHintLabelPart, InlayHintLabelPartTooltip, InlayHintTooltip, Location,
+    LocationLink, MarkupContent, Project, ProjectTransaction, ResolveState,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -10,11 +10,10 @@ use futures::future;
 use gpui::{AppContext, AsyncAppContext, Model};
 use language::{
     language_settings::{language_settings, InlayHintKind},
-    point_from_lsp, point_to_lsp, prepare_completion_documentation,
+    point_from_lsp, point_to_lsp,
     proto::{deserialize_anchor, deserialize_version, serialize_anchor, serialize_version},
     range_from_lsp, range_to_lsp, Anchor, Bias, Buffer, BufferSnapshot, CachedLspAdapter, CharKind,
-    CodeAction, Completion, OffsetRangeExt, PointUtf16, ToOffset, ToPointUtf16, Transaction,
-    Unclipped,
+    OffsetRangeExt, PointUtf16, ToOffset, ToPointUtf16, Transaction, Unclipped,
 };
 use lsp::{
     CompletionListItemDefaultsEditRange, DocumentHighlightKind, LanguageServer, LanguageServerId,
@@ -40,6 +39,10 @@ pub trait LspCommand: 'static + Sized + Send {
 
     fn check_capabilities(&self, _: &lsp::ServerCapabilities) -> bool {
         true
+    }
+
+    fn status(&self) -> Option<String> {
+        None
     }
 
     fn to_lsp(
@@ -97,11 +100,15 @@ pub(crate) struct PerformRename {
     pub push_to_history: bool,
 }
 
-pub(crate) struct GetDefinition {
+pub struct GetDefinition {
     pub position: PointUtf16,
 }
 
 pub(crate) struct GetTypeDefinition {
+    pub position: PointUtf16,
+}
+
+pub(crate) struct GetImplementation {
     pub position: PointUtf16,
 }
 
@@ -113,6 +120,7 @@ pub(crate) struct GetDocumentHighlights {
     pub position: PointUtf16,
 }
 
+#[derive(Clone)]
 pub(crate) struct GetHover {
     pub position: PointUtf16,
 }
@@ -121,8 +129,10 @@ pub(crate) struct GetCompletions {
     pub position: PointUtf16,
 }
 
+#[derive(Clone)]
 pub(crate) struct GetCodeActions {
     pub range: Range<Anchor>,
+    pub kinds: Option<Vec<lsp::CodeActionKind>>,
 }
 
 pub(crate) struct OnTypeFormatting {
@@ -492,6 +502,99 @@ impl LspCommand for GetDefinition {
 }
 
 #[async_trait(?Send)]
+impl LspCommand for GetImplementation {
+    type Response = Vec<LocationLink>;
+    type LspRequest = lsp::request::GotoImplementation;
+    type ProtoRequest = proto::GetImplementation;
+
+    fn to_lsp(
+        &self,
+        path: &Path,
+        _: &Buffer,
+        _: &Arc<LanguageServer>,
+        _: &AppContext,
+    ) -> lsp::GotoImplementationParams {
+        lsp::GotoImplementationParams {
+            text_document_position_params: lsp::TextDocumentPositionParams {
+                text_document: lsp::TextDocumentIdentifier {
+                    uri: lsp::Url::from_file_path(path).unwrap(),
+                },
+                position: point_to_lsp(self.position),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    async fn response_from_lsp(
+        self,
+        message: Option<lsp::GotoImplementationResponse>,
+        project: Model<Project>,
+        buffer: Model<Buffer>,
+        server_id: LanguageServerId,
+        cx: AsyncAppContext,
+    ) -> Result<Vec<LocationLink>> {
+        location_links_from_lsp(message, project, buffer, server_id, cx).await
+    }
+
+    fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetImplementation {
+        proto::GetImplementation {
+            project_id,
+            buffer_id: buffer.remote_id().into(),
+            position: Some(language::proto::serialize_anchor(
+                &buffer.anchor_before(self.position),
+            )),
+            version: serialize_version(&buffer.version()),
+        }
+    }
+
+    async fn from_proto(
+        message: proto::GetImplementation,
+        _: Model<Project>,
+        buffer: Model<Buffer>,
+        mut cx: AsyncAppContext,
+    ) -> Result<Self> {
+        let position = message
+            .position
+            .and_then(deserialize_anchor)
+            .ok_or_else(|| anyhow!("invalid position"))?;
+        buffer
+            .update(&mut cx, |buffer, _| {
+                buffer.wait_for_version(deserialize_version(&message.version))
+            })?
+            .await?;
+        Ok(Self {
+            position: buffer.update(&mut cx, |buffer, _| position.to_point_utf16(buffer))?,
+        })
+    }
+
+    fn response_to_proto(
+        response: Vec<LocationLink>,
+        project: &mut Project,
+        peer_id: PeerId,
+        _: &clock::Global,
+        cx: &mut AppContext,
+    ) -> proto::GetImplementationResponse {
+        let links = location_links_to_proto(response, project, peer_id, cx);
+        proto::GetImplementationResponse { links }
+    }
+
+    async fn response_from_proto(
+        self,
+        message: proto::GetImplementationResponse,
+        project: Model<Project>,
+        _: Model<Buffer>,
+        cx: AsyncAppContext,
+    ) -> Result<Vec<LocationLink>> {
+        location_links_from_proto(message.links, project, cx).await
+    }
+
+    fn buffer_id_from_proto(message: &proto::GetImplementation) -> Result<BufferId> {
+        BufferId::new(message.buffer_id)
+    }
+}
+
+#[async_trait(?Send)]
 impl LspCommand for GetTypeDefinition {
     type Response = Vec<LocationLink>;
     type LspRequest = lsp::request::GotoTypeDefinition;
@@ -795,6 +898,18 @@ impl LspCommand for GetReferences {
     type Response = Vec<Location>;
     type LspRequest = lsp::request::References;
     type ProtoRequest = proto::GetReferences;
+
+    fn status(&self) -> Option<String> {
+        return Some("Finding references...".to_owned());
+    }
+
+    fn check_capabilities(&self, capabilities: &ServerCapabilities) -> bool {
+        match &capabilities.references_provider {
+            Some(OneOf::Left(has_support)) => *has_support,
+            Some(OneOf::Right(_)) => true,
+            None => false,
+        }
+    }
 
     fn to_lsp(
         &self,
@@ -1307,6 +1422,13 @@ impl LspCommand for GetHover {
         } else {
             None
         };
+        if let Some(range) = range.as_ref() {
+            buffer
+                .update(&mut cx, |buffer, _| {
+                    buffer.wait_for_anchors([range.start, range.end])
+                })?
+                .await?;
+        }
 
         Ok(Some(Hover {
             contents,
@@ -1322,7 +1444,7 @@ impl LspCommand for GetHover {
 
 #[async_trait(?Send)]
 impl LspCommand for GetCompletions {
-    type Response = Vec<Completion>;
+    type Response = Vec<CoreCompletion>;
     type LspRequest = lsp::request::Completion;
     type ProtoRequest = proto::GetCompletions;
 
@@ -1351,9 +1473,9 @@ impl LspCommand for GetCompletions {
         buffer: Model<Buffer>,
         server_id: LanguageServerId,
         mut cx: AsyncAppContext,
-    ) -> Result<Vec<Completion>> {
+    ) -> Result<Self::Response> {
         let mut response_list = None;
-        let completions = if let Some(completions) = completions {
+        let mut completions = if let Some(completions) = completions {
             match completions {
                 lsp::CompletionResponse::Array(completions) => completions,
 
@@ -1367,132 +1489,104 @@ impl LspCommand for GetCompletions {
             Default::default()
         };
 
-        let completions = buffer.update(&mut cx, |buffer, cx| {
-            let language_registry = project.read(cx).languages().clone();
-            let language = buffer.language().cloned();
+        let language_server_adapter = project
+            .update(&mut cx, |project, _cx| {
+                project.language_server_adapter_for_id(server_id)
+            })?
+            .ok_or_else(|| anyhow!("no such language server"))?;
+
+        let mut completion_edits = Vec::new();
+        buffer.update(&mut cx, |buffer, _cx| {
             let snapshot = buffer.snapshot();
             let clipped_position = buffer.clip_point_utf16(Unclipped(self.position), Bias::Left);
 
             let mut range_for_token = None;
-            completions
-                .into_iter()
-                .filter_map(move |mut lsp_completion| {
-                    let (old_range, mut new_text) = match lsp_completion.text_edit.as_ref() {
-                        // If the language server provides a range to overwrite, then
-                        // check that the range is valid.
-                        Some(lsp::CompletionTextEdit::Edit(edit)) => {
-                            let range = range_from_lsp(edit.range);
+            completions.retain_mut(|lsp_completion| {
+                let edit = match lsp_completion.text_edit.as_ref() {
+                    // If the language server provides a range to overwrite, then
+                    // check that the range is valid.
+                    Some(completion_text_edit) => {
+                        match parse_completion_text_edit(completion_text_edit, &snapshot) {
+                            Some(edit) => edit,
+                            None => return false,
+                        }
+                    }
+
+                    // If the language server does not provide a range, then infer
+                    // the range based on the syntax tree.
+                    None => {
+                        if self.position != clipped_position {
+                            log::info!("completion out of expected range");
+                            return false;
+                        }
+
+                        let default_edit_range = response_list
+                            .as_ref()
+                            .and_then(|list| list.item_defaults.as_ref())
+                            .and_then(|defaults| defaults.edit_range.as_ref())
+                            .and_then(|range| match range {
+                                CompletionListItemDefaultsEditRange::Range(r) => Some(r),
+                                _ => None,
+                            });
+
+                        let range = if let Some(range) = default_edit_range {
+                            let range = range_from_lsp(*range);
                             let start = snapshot.clip_point_utf16(range.start, Bias::Left);
                             let end = snapshot.clip_point_utf16(range.end, Bias::Left);
                             if start != range.start.0 || end != range.end.0 {
                                 log::info!("completion out of expected range");
-                                return None;
-                            }
-                            (
-                                snapshot.anchor_before(start)..snapshot.anchor_after(end),
-                                edit.new_text.clone(),
-                            )
-                        }
-
-                        // If the language server does not provide a range, then infer
-                        // the range based on the syntax tree.
-                        None => {
-                            if self.position != clipped_position {
-                                log::info!("completion out of expected range");
-                                return None;
+                                return false;
                             }
 
-                            let default_edit_range = response_list
-                                .as_ref()
-                                .and_then(|list| list.item_defaults.as_ref())
-                                .and_then(|defaults| defaults.edit_range.as_ref())
-                                .and_then(|range| match range {
-                                    CompletionListItemDefaultsEditRange::Range(r) => Some(r),
-                                    _ => None,
-                                });
-
-                            let range = if let Some(range) = default_edit_range {
-                                let range = range_from_lsp(range.clone());
-                                let start = snapshot.clip_point_utf16(range.start, Bias::Left);
-                                let end = snapshot.clip_point_utf16(range.end, Bias::Left);
-                                if start != range.start.0 || end != range.end.0 {
-                                    log::info!("completion out of expected range");
-                                    return None;
-                                }
-
-                                snapshot.anchor_before(start)..snapshot.anchor_after(end)
-                            } else {
-                                range_for_token
-                                    .get_or_insert_with(|| {
-                                        let offset = self.position.to_offset(&snapshot);
-                                        let (range, kind) = snapshot.surrounding_word(offset);
-                                        let range = if kind == Some(CharKind::Word) {
-                                            range
-                                        } else {
-                                            offset..offset
-                                        };
-
-                                        snapshot.anchor_before(range.start)
-                                            ..snapshot.anchor_after(range.end)
-                                    })
-                                    .clone()
-                            };
-
-                            let text = lsp_completion
-                                .insert_text
-                                .as_ref()
-                                .unwrap_or(&lsp_completion.label)
-                                .clone();
-                            (range, text)
-                        }
-
-                        Some(lsp::CompletionTextEdit::InsertAndReplace(_)) => {
-                            log::info!("unsupported insert/replace completion");
-                            return None;
-                        }
-                    };
-
-                    let language_registry = language_registry.clone();
-                    let language = language.clone();
-                    LineEnding::normalize(&mut new_text);
-                    Some(async move {
-                        let mut label = None;
-                        if let Some(language) = language.as_ref() {
-                            language.process_completion(&mut lsp_completion).await;
-                            label = language.label_for_completion(&lsp_completion).await;
-                        }
-
-                        let documentation = if let Some(lsp_docs) = &lsp_completion.documentation {
-                            Some(
-                                prepare_completion_documentation(
-                                    lsp_docs,
-                                    &language_registry,
-                                    language.clone(),
-                                )
-                                .await,
-                            )
+                            snapshot.anchor_before(start)..snapshot.anchor_after(end)
                         } else {
-                            None
+                            range_for_token
+                                .get_or_insert_with(|| {
+                                    let offset = self.position.to_offset(&snapshot);
+                                    let (range, kind) = snapshot.surrounding_word(offset);
+                                    let range = if kind == Some(CharKind::Word) {
+                                        range
+                                    } else {
+                                        offset..offset
+                                    };
+
+                                    snapshot.anchor_before(range.start)
+                                        ..snapshot.anchor_after(range.end)
+                                })
+                                .clone()
                         };
 
-                        Completion {
-                            old_range,
-                            new_text,
-                            label: label.unwrap_or_else(|| {
-                                language::CodeLabel::plain(
-                                    lsp_completion.label.clone(),
-                                    lsp_completion.filter_text.as_deref(),
-                                )
-                            }),
-                            documentation,
-                            server_id,
-                            lsp_completion,
-                        }
-                    })
-                })
+                        let text = lsp_completion
+                            .insert_text
+                            .as_ref()
+                            .unwrap_or(&lsp_completion.label)
+                            .clone();
+                        (range, text)
+                    }
+                };
+
+                completion_edits.push(edit);
+                true
+            });
         })?;
 
-        Ok(future::join_all(completions).await)
+        language_server_adapter
+            .process_completions(&mut completions)
+            .await;
+
+        Ok(completions
+            .into_iter()
+            .zip(completion_edits)
+            .map(|(lsp_completion, (old_range, mut new_text))| {
+                LineEnding::normalize(&mut new_text);
+                CoreCompletion {
+                    old_range,
+                    new_text,
+                    server_id,
+                    lsp_completion,
+                }
+            })
+            .collect())
     }
 
     fn to_proto(&self, project_id: u64, buffer: &Buffer) -> proto::GetCompletions {
@@ -1528,7 +1622,7 @@ impl LspCommand for GetCompletions {
     }
 
     fn response_to_proto(
-        completions: Vec<Completion>,
+        completions: Vec<CoreCompletion>,
         _: &mut Project,
         _: PeerId,
         buffer_version: &clock::Global,
@@ -1537,7 +1631,7 @@ impl LspCommand for GetCompletions {
         proto::GetCompletionsResponse {
             completions: completions
                 .iter()
-                .map(language::proto::serialize_completion)
+                .map(Project::serialize_completion)
                 .collect(),
             version: serialize_version(buffer_version),
         }
@@ -1546,25 +1640,63 @@ impl LspCommand for GetCompletions {
     async fn response_from_proto(
         self,
         message: proto::GetCompletionsResponse,
-        _: Model<Project>,
+        _project: Model<Project>,
         buffer: Model<Buffer>,
         mut cx: AsyncAppContext,
-    ) -> Result<Vec<Completion>> {
+    ) -> Result<Self::Response> {
         buffer
             .update(&mut cx, |buffer, _| {
                 buffer.wait_for_version(deserialize_version(&message.version))
             })?
             .await?;
 
-        let language = buffer.update(&mut cx, |buffer, _| buffer.language().cloned())?;
-        let completions = message.completions.into_iter().map(|completion| {
-            language::proto::deserialize_completion(completion, language.clone())
-        });
-        future::try_join_all(completions).await
+        message
+            .completions
+            .into_iter()
+            .map(Project::deserialize_completion)
+            .collect()
     }
 
     fn buffer_id_from_proto(message: &proto::GetCompletions) -> Result<BufferId> {
         BufferId::new(message.buffer_id)
+    }
+}
+
+pub(crate) fn parse_completion_text_edit(
+    edit: &lsp::CompletionTextEdit,
+    snapshot: &BufferSnapshot,
+) -> Option<(Range<Anchor>, String)> {
+    match edit {
+        lsp::CompletionTextEdit::Edit(edit) => {
+            let range = range_from_lsp(edit.range);
+            let start = snapshot.clip_point_utf16(range.start, Bias::Left);
+            let end = snapshot.clip_point_utf16(range.end, Bias::Left);
+            if start != range.start.0 || end != range.end.0 {
+                log::info!("completion out of expected range");
+                None
+            } else {
+                Some((
+                    snapshot.anchor_before(start)..snapshot.anchor_after(end),
+                    edit.new_text.clone(),
+                ))
+            }
+        }
+
+        lsp::CompletionTextEdit::InsertAndReplace(edit) => {
+            let range = range_from_lsp(edit.insert);
+
+            let start = snapshot.clip_point_utf16(range.start, Bias::Left);
+            let end = snapshot.clip_point_utf16(range.end, Bias::Left);
+            if start != range.start.0 || end != range.end.0 {
+                log::info!("completion out of expected range");
+                None
+            } else {
+                Some((
+                    snapshot.anchor_before(start)..snapshot.anchor_after(end),
+                    edit.new_text.clone(),
+                ))
+            }
+        }
     }
 }
 
@@ -1591,9 +1723,10 @@ impl LspCommand for GetCodeActions {
     ) -> lsp::CodeActionParams {
         let relevant_diagnostics = buffer
             .snapshot()
-            .diagnostics_in_range::<_, usize>(self.range.clone(), false)
+            .diagnostics_in_range::<_, language::PointUtf16>(self.range.clone(), false)
             .map(|entry| entry.to_lsp_diagnostic_stub())
-            .collect();
+            .collect::<Vec<_>>();
+
         lsp::CodeActionParams {
             text_document: lsp::TextDocumentIdentifier::new(
                 lsp::Url::from_file_path(path).unwrap(),
@@ -1603,7 +1736,10 @@ impl LspCommand for GetCodeActions {
             partial_result_params: Default::default(),
             context: lsp::CodeActionContext {
                 diagnostics: relevant_diagnostics,
-                only: language_server.code_action_kinds(),
+                only: self
+                    .kinds
+                    .clone()
+                    .or_else(|| language_server.code_action_kinds()),
                 ..lsp::CodeActionContext::default()
             },
         }
@@ -1664,7 +1800,10 @@ impl LspCommand for GetCodeActions {
             })?
             .await?;
 
-        Ok(Self { range: start..end })
+        Ok(Self {
+            range: start..end,
+            kinds: None,
+        })
     }
 
     fn response_to_proto(
@@ -1677,7 +1816,7 @@ impl LspCommand for GetCodeActions {
         proto::GetCodeActionsResponse {
             actions: code_actions
                 .iter()
-                .map(language::proto::serialize_code_action)
+                .map(Project::serialize_code_action)
                 .collect(),
             version: serialize_version(buffer_version),
         }
@@ -1698,12 +1837,36 @@ impl LspCommand for GetCodeActions {
         message
             .actions
             .into_iter()
-            .map(language::proto::deserialize_code_action)
+            .map(Project::deserialize_code_action)
             .collect()
     }
 
     fn buffer_id_from_proto(message: &proto::GetCodeActions) -> Result<BufferId> {
         BufferId::new(message.buffer_id)
+    }
+}
+
+impl GetCodeActions {
+    pub fn can_resolve_actions(capabilities: &ServerCapabilities) -> bool {
+        capabilities
+            .code_action_provider
+            .as_ref()
+            .and_then(|options| match options {
+                lsp::CodeActionProviderCapability::Simple(_is_supported) => None,
+                lsp::CodeActionProviderCapability::Options(options) => options.resolve_provider,
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn supports_code_actions(capabilities: &ServerCapabilities) -> bool {
+        capabilities
+            .code_action_provider
+            .as_ref()
+            .map(|options| match options {
+                lsp::CodeActionProviderCapability::Simple(is_supported) => *is_supported,
+                lsp::CodeActionProviderCapability::Options(_) => true,
+            })
+            .unwrap_or(false)
     }
 }
 

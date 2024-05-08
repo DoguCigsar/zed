@@ -115,16 +115,13 @@ impl RenderOnce for Avatar {
                 div
             })
             .when_some(self.border_color, |this, color| {
-                this.border_width(border_width).border_color(color)
+                this.border(border_width).border_color(color)
             })
             .child(
                 self.image
                     .size(image_size)
                     .bg(cx.theme().colors().ghost_element_background),
             )
-            .children(
-                self.indicator
-                    .map(|indicator| div().z_index(1).child(indicator)),
-            )
+            .children(self.indicator.map(|indicator| div().child(indicator)))
     }
 }

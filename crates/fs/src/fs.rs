@@ -1,56 +1,73 @@
-pub mod repository;
-
 use anyhow::{anyhow, Result};
-#[cfg(target_os = "macos")]
-pub use fsevent::Event;
-#[cfg(target_os = "macos")]
-use fsevent::EventStream;
+use git::GitHostingProviderRegistry;
 
-#[cfg(not(target_os = "macos"))]
-pub use notify::Event;
-#[cfg(not(target_os = "macos"))]
-use notify::{Config, Watcher};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
-use futures::{future::BoxFuture, Stream, StreamExt};
+use futures::{future::BoxFuture, AsyncRead, Stream, StreamExt};
+use git::repository::{GitRepository, RealGitRepository};
 use git2::Repository as LibGitRepository;
 use parking_lot::Mutex;
-use repository::GitRepository;
 use rope::Rope;
-use smol::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(any(test, feature = "test-support"))]
+use smol::io::AsyncReadExt;
+use smol::io::AsyncWriteExt;
 use std::io::Write;
 use std::sync::Arc;
 use std::{
     io,
-    os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
     pin::Pin,
     time::{Duration, SystemTime},
 };
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 use text::LineEnding;
-use util::ResultExt;
+use util::{paths, ResultExt};
 
 #[cfg(any(test, feature = "test-support"))]
 use collections::{btree_map, BTreeMap};
 #[cfg(any(test, feature = "test-support"))]
-use repository::{FakeGitRepositoryState, GitFileStatus};
+use git::repository::{FakeGitRepositoryState, GitFileStatus};
 #[cfg(any(test, feature = "test-support"))]
 use std::ffi::OsStr;
 
 #[async_trait::async_trait]
 pub trait Fs: Send + Sync {
     async fn create_dir(&self, path: &Path) -> Result<()>;
+    async fn create_symlink(&self, path: &Path, target: PathBuf) -> Result<()>;
     async fn create_file(&self, path: &Path, options: CreateOptions) -> Result<()>;
+    async fn create_file_with(
+        &self,
+        path: &Path,
+        content: Pin<&mut (dyn AsyncRead + Send)>,
+    ) -> Result<()>;
+    async fn extract_tar_gz_file(
+        &self,
+        path: &Path,
+        content: Pin<&mut (dyn AsyncRead + Send)>,
+    ) -> Result<()>;
+    async fn extract_zip_file(
+        &self,
+        dst: &Path,
+        content: Pin<&mut (dyn AsyncRead + Send)>,
+    ) -> Result<()>;
     async fn copy_file(&self, source: &Path, target: &Path, options: CopyOptions) -> Result<()>;
     async fn rename(&self, source: &Path, target: &Path, options: RenameOptions) -> Result<()>;
     async fn remove_dir(&self, path: &Path, options: RemoveOptions) -> Result<()>;
+    async fn trash_dir(&self, path: &Path, options: RemoveOptions) -> Result<()> {
+        self.remove_dir(path, options).await
+    }
     async fn remove_file(&self, path: &Path, options: RemoveOptions) -> Result<()>;
+    async fn trash_file(&self, path: &Path, options: RemoveOptions) -> Result<()> {
+        self.remove_file(path, options).await
+    }
     async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read>>;
     async fn load(&self, path: &Path) -> Result<String>;
     async fn atomic_write(&self, path: PathBuf, text: String) -> Result<()>;
     async fn save(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()>;
     async fn canonicalize(&self, path: &Path) -> Result<PathBuf>;
     async fn is_file(&self, path: &Path) -> bool;
+    async fn is_dir(&self, path: &Path) -> bool;
     async fn metadata(&self, path: &Path) -> Result<Option<Metadata>>;
     async fn read_link(&self, path: &Path) -> Result<PathBuf>;
     async fn read_dir(
@@ -62,10 +79,11 @@ pub trait Fs: Send + Sync {
         &self,
         path: &Path,
         latency: Duration,
-    ) -> Pin<Box<dyn Send + Stream<Item = Vec<Event>>>>;
+    ) -> Pin<Box<dyn Send + Stream<Item = Vec<PathBuf>>>>;
 
     fn open_repo(&self, abs_dot_git: &Path) -> Option<Arc<Mutex<dyn GitRepository>>>;
     fn is_fake(&self) -> bool;
+    async fn is_case_sensitive(&self) -> Result<bool>;
     #[cfg(any(test, feature = "test-support"))]
     fn as_fake(&self) -> &FakeFs;
 }
@@ -102,12 +120,42 @@ pub struct Metadata {
     pub is_dir: bool,
 }
 
-pub struct RealFs;
+#[derive(Default)]
+pub struct RealFs {
+    git_hosting_provider_registry: Arc<GitHostingProviderRegistry>,
+    git_binary_path: Option<PathBuf>,
+}
+
+impl RealFs {
+    pub fn new(
+        git_hosting_provider_registry: Arc<GitHostingProviderRegistry>,
+        git_binary_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            git_hosting_provider_registry,
+            git_binary_path,
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl Fs for RealFs {
     async fn create_dir(&self, path: &Path) -> Result<()> {
         Ok(smol::fs::create_dir_all(path).await?)
+    }
+
+    async fn create_symlink(&self, path: &Path, target: PathBuf) -> Result<()> {
+        #[cfg(unix)]
+        smol::fs::unix::symlink(target, path).await?;
+
+        #[cfg(windows)]
+        if smol::fs::metadata(&target).await?.is_dir() {
+            smol::fs::windows::symlink_dir(target, path).await?
+        } else {
+            smol::fs::windows::symlink_file(target, path).await?
+        }
+
+        Ok(())
     }
 
     async fn create_file(&self, path: &Path, options: CreateOptions) -> Result<()> {
@@ -119,6 +167,34 @@ impl Fs for RealFs {
             open_options.create_new(true);
         }
         open_options.open(path).await?;
+        Ok(())
+    }
+
+    async fn create_file_with(
+        &self,
+        path: &Path,
+        content: Pin<&mut (dyn AsyncRead + Send)>,
+    ) -> Result<()> {
+        let mut file = smol::fs::File::create(&path).await?;
+        futures::io::copy(content, &mut file).await?;
+        Ok(())
+    }
+
+    async fn extract_tar_gz_file(
+        &self,
+        path: &Path,
+        content: Pin<&mut (dyn AsyncRead + Send)>,
+    ) -> Result<()> {
+        archive::extract_tar_gz(path, content).await?;
+        Ok(())
+    }
+
+    async fn extract_zip_file(
+        &self,
+        dst: &Path,
+        content: Pin<&mut (dyn AsyncRead + Send)>,
+    ) -> Result<()> {
+        archive::extract_zip(dst, content).await?;
         Ok(())
     }
 
@@ -164,6 +240,21 @@ impl Fs for RealFs {
     }
 
     async fn remove_file(&self, path: &Path, options: RemoveOptions) -> Result<()> {
+        #[cfg(windows)]
+        if let Ok(Some(metadata)) = self.metadata(path).await {
+            if metadata.is_symlink && metadata.is_dir {
+                self.remove_dir(
+                    path,
+                    RemoveOptions {
+                        recursive: false,
+                        ignore_if_not_exists: true,
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
         match smol::fs::remove_file(path).await {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound && options.ignore_if_not_exists => {
@@ -173,20 +264,53 @@ impl Fs for RealFs {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    async fn trash_file(&self, path: &Path, _options: RemoveOptions) -> Result<()> {
+        use cocoa::{
+            base::{id, nil},
+            foundation::{NSAutoreleasePool, NSString},
+        };
+        use objc::{class, msg_send, sel, sel_impl};
+
+        unsafe {
+            unsafe fn ns_string(string: &str) -> id {
+                NSString::alloc(nil).init_str(string).autorelease()
+            }
+
+            let url: id = msg_send![class!(NSURL), fileURLWithPath: ns_string(path.to_string_lossy().as_ref())];
+            let array: id = msg_send![class!(NSArray), arrayWithObject: url];
+            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+
+            let _: id = msg_send![workspace, recycleURLs: array completionHandler: nil];
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn trash_dir(&self, path: &Path, options: RemoveOptions) -> Result<()> {
+        self.trash_file(path, options).await
+    }
+
     async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read>> {
         Ok(Box::new(std::fs::File::open(path)?))
     }
 
     async fn load(&self, path: &Path) -> Result<String> {
-        let mut file = smol::fs::File::open(path).await?;
-        let mut text = String::new();
-        file.read_to_string(&mut text).await?;
+        let path = path.to_path_buf();
+        let text = smol::unblock(|| std::fs::read_to_string(path)).await?;
         Ok(text)
     }
 
     async fn atomic_write(&self, path: PathBuf, data: String) -> Result<()> {
         smol::unblock(move || {
-            let mut tmp_file = NamedTempFile::new()?;
+            let mut tmp_file = if cfg!(target_os = "linux") {
+                // Use the directory of the destination as temp dir to avoid
+                // invalid cross-device link error, and XDG_CACHE_DIR for fallback.
+                // See https://github.com/zed-industries/zed/pull/8437 for more details.
+                NamedTempFile::new_in(path.parent().unwrap_or(&paths::TEMP_DIR))
+            } else {
+                NamedTempFile::new()
+            }?;
             tmp_file.write_all(data.as_bytes())?;
             tmp_file.persist(path)?;
             Ok::<(), anyhow::Error>(())
@@ -220,6 +344,12 @@ impl Fs for RealFs {
             .map_or(false, |metadata| metadata.is_file())
     }
 
+    async fn is_dir(&self, path: &Path) -> bool {
+        smol::fs::metadata(path)
+            .await
+            .map_or(false, |metadata| metadata.is_dir())
+    }
+
     async fn metadata(&self, path: &Path) -> Result<Option<Metadata>> {
         let symlink_metadata = match smol::fs::symlink_metadata(path).await {
             Ok(metadata) => metadata,
@@ -238,8 +368,15 @@ impl Fs for RealFs {
         } else {
             symlink_metadata
         };
+
+        #[cfg(unix)]
+        let inode = metadata.ino();
+
+        #[cfg(windows)]
+        let inode = file_id(path).await?;
+
         Ok(Some(Metadata {
-            inode: metadata.ino(),
+            inode,
             mtime: metadata.modified().unwrap(),
             is_symlink,
             is_dir: metadata.file_type().is_dir(),
@@ -267,12 +404,18 @@ impl Fs for RealFs {
         &self,
         path: &Path,
         latency: Duration,
-    ) -> Pin<Box<dyn Send + Stream<Item = Vec<Event>>>> {
+    ) -> Pin<Box<dyn Send + Stream<Item = Vec<PathBuf>>>> {
+        use fsevent::EventStream;
+
         let (tx, rx) = smol::channel::unbounded();
         let (stream, handle) = EventStream::new(&[path], latency);
         std::thread::spawn(move || {
-            stream.run(move |events| smol::block_on(tx.send(events)).is_ok());
+            stream.run(move |events| {
+                smol::block_on(tx.send(events.into_iter().map(|event| event.path).collect()))
+                    .is_ok()
+            });
         });
+
         Box::pin(rx.chain(futures::stream::once(async move {
             drop(handle);
             vec![]
@@ -283,60 +426,125 @@ impl Fs for RealFs {
     async fn watch(
         &self,
         path: &Path,
-        latency: Duration,
-    ) -> Pin<Box<dyn Send + Stream<Item = Vec<Event>>>> {
+        _latency: Duration,
+    ) -> Pin<Box<dyn Send + Stream<Item = Vec<PathBuf>>>> {
+        use notify::{event::EventKind, Watcher};
+        // todo(linux): This spawns two threads, while the macOS impl
+        // only spawns one. Can we use a OnceLock or some such to make
+        // this better
+
         let (tx, rx) = smol::channel::unbounded();
 
-        let mut watcher = notify::recommended_watcher(move |res| match res {
-            Ok(event) => {
-                let _ = tx.try_send(vec![event]);
-            }
-            Err(err) => {
-                eprintln!("watch error: {:?}", err);
+        let mut file_watcher = notify::recommended_watcher({
+            let tx = tx.clone();
+            move |event: Result<notify::Event, _>| {
+                if let Some(event) = event.log_err() {
+                    tx.try_send(event.paths).ok();
+                }
             }
         })
-        .unwrap();
+        .expect("Could not start file watcher");
 
-        watcher
-            .configure(Config::default().with_poll_interval(latency))
-            .unwrap();
-
-        watcher
+        file_watcher
             .watch(path, notify::RecursiveMode::Recursive)
-            .unwrap();
+            .ok(); // It's ok if this fails, the parent watcher will add it.
 
-        Box::pin(rx)
+        let mut parent_watcher = notify::recommended_watcher({
+            let watched_path = path.to_path_buf();
+            let tx = tx.clone();
+            move |event: Result<notify::Event, _>| {
+                if let Some(event) = event.ok() {
+                    if event.paths.into_iter().any(|path| *path == watched_path) {
+                        match event.kind {
+                            EventKind::Create(_) => {
+                                file_watcher
+                                    .watch(watched_path.as_path(), notify::RecursiveMode::Recursive)
+                                    .log_err();
+                                let _ = tx.try_send(vec![watched_path.clone()]).ok();
+                            }
+                            EventKind::Remove(_) => {
+                                file_watcher.unwatch(&watched_path).log_err();
+                                let _ = tx.try_send(vec![watched_path.clone()]).ok();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        })
+        .expect("Could not start file watcher");
+
+        parent_watcher
+            .watch(
+                path.parent()
+                    .expect("Watching root is probably not what you want"),
+                notify::RecursiveMode::NonRecursive,
+            )
+            .expect("Could not start watcher on parent directory");
+
+        Box::pin(rx.chain(futures::stream::once(async move {
+            drop(parent_watcher);
+            vec![]
+        })))
     }
 
     fn open_repo(&self, dotgit_path: &Path) -> Option<Arc<Mutex<dyn GitRepository>>> {
-        LibGitRepository::open(&dotgit_path)
+        LibGitRepository::open(dotgit_path)
             .log_err()
-            .and_then::<Arc<Mutex<dyn GitRepository>>, _>(|libgit_repository| {
-                Some(Arc::new(Mutex::new(libgit_repository)))
+            .map::<Arc<Mutex<dyn GitRepository>>, _>(|libgit_repository| {
+                Arc::new(Mutex::new(RealGitRepository::new(
+                    libgit_repository,
+                    self.git_binary_path.clone(),
+                    self.git_hosting_provider_registry.clone(),
+                )))
             })
     }
 
     fn is_fake(&self) -> bool {
         false
     }
+
+    /// Checks whether the file system is case sensitive by attempting to create two files
+    /// that have the same name except for the casing.
+    ///
+    /// It creates both files in a temporary directory it removes at the end.
+    async fn is_case_sensitive(&self) -> Result<bool> {
+        let temp_dir = TempDir::new()?;
+        let test_file_1 = temp_dir.path().join("case_sensitivity_test.tmp");
+        let test_file_2 = temp_dir.path().join("CASE_SENSITIVITY_TEST.TMP");
+
+        let create_opts = CreateOptions {
+            overwrite: false,
+            ignore_if_exists: false,
+        };
+
+        // Create file1
+        self.create_file(&test_file_1, create_opts).await?;
+
+        // Now check whether it's possible to create file2
+        let case_sensitive = match self.create_file(&test_file_2, create_opts).await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                if let Some(io_error) = e.downcast_ref::<io::Error>() {
+                    if io_error.kind() == io::ErrorKind::AlreadyExists {
+                        Ok(false)
+                    } else {
+                        Err(e)
+                    }
+                } else {
+                    Err(e)
+                }
+            }
+        };
+
+        temp_dir.close()?;
+        case_sensitive
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn as_fake(&self) -> &FakeFs {
         panic!("called `RealFs::as_fake`")
     }
-}
-
-#[cfg(target_os = "macos")]
-pub fn fs_events_paths(events: Vec<Event>) -> Vec<PathBuf> {
-    events.into_iter().map(|event| event.path).collect()
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn fs_events_paths(events: Vec<Event>) -> Vec<PathBuf> {
-    events
-        .into_iter()
-        .map(|event| event.paths.into_iter())
-        .flatten()
-        .collect()
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -351,9 +559,9 @@ struct FakeFsState {
     root: Arc<Mutex<FakeFsEntry>>,
     next_inode: u64,
     next_mtime: SystemTime,
-    event_txs: Vec<smol::channel::Sender<Vec<fsevent::Event>>>,
+    event_txs: Vec<smol::channel::Sender<Vec<PathBuf>>>,
     events_paused: bool,
-    buffered_events: Vec<fsevent::Event>,
+    buffered_events: Vec<PathBuf>,
     metadata_call_count: usize,
     read_dir_call_count: usize,
 }
@@ -364,13 +572,13 @@ enum FakeFsEntry {
     File {
         inode: u64,
         mtime: SystemTime,
-        content: String,
+        content: Vec<u8>,
     },
     Dir {
         inode: u64,
         mtime: SystemTime,
         entries: BTreeMap<String, Arc<Mutex<FakeFsEntry>>>,
-        git_repo_state: Option<Arc<Mutex<repository::FakeGitRepositoryState>>>,
+        git_repo_state: Option<Arc<Mutex<git::repository::FakeGitRepositoryState>>>,
     },
     Symlink {
         target: PathBuf,
@@ -379,15 +587,20 @@ enum FakeFsEntry {
 
 #[cfg(any(test, feature = "test-support"))]
 impl FakeFsState {
-    fn read_path<'a>(&'a self, target: &Path) -> Result<Arc<Mutex<FakeFsEntry>>> {
+    fn read_path(&self, target: &Path) -> Result<Arc<Mutex<FakeFsEntry>>> {
         Ok(self
             .try_read_path(target, true)
-            .ok_or_else(|| anyhow!("path does not exist: {}", target.display()))?
+            .ok_or_else(|| {
+                anyhow!(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("not found: {}", target.display())
+                ))
+            })?
             .0)
     }
 
-    fn try_read_path<'a>(
-        &'a self,
+    fn try_read_path(
+        &self,
         target: &Path,
         follow_symlink: bool,
     ) -> Option<(Arc<Mutex<FakeFsEntry>>, PathBuf)> {
@@ -461,11 +674,7 @@ impl FakeFsState {
         T: Into<PathBuf>,
     {
         self.buffered_events
-            .extend(paths.into_iter().map(|path| fsevent::Event {
-                event_id: 0,
-                flags: fsevent::StreamFlags::empty(),
-                path: path.into(),
-            }));
+            .extend(paths.into_iter().map(Into::into));
 
         if !self.events_paused {
             self.flush_events(self.buffered_events.len());
@@ -510,7 +719,7 @@ impl FakeFs {
         })
     }
 
-    pub async fn insert_file(&self, path: impl AsRef<Path>, content: String) {
+    pub async fn insert_file(&self, path: impl AsRef<Path>, content: Vec<u8>) {
         self.write_file_internal(path, content).unwrap()
     }
 
@@ -530,10 +739,10 @@ impl FakeFs {
                 }
             })
             .unwrap();
-        state.emit_event(&[path]);
+        state.emit_event([path]);
     }
 
-    pub fn write_file_internal(&self, path: impl AsRef<Path>, content: String) -> Result<()> {
+    fn write_file_internal(&self, path: impl AsRef<Path>, content: Vec<u8>) -> Result<()> {
         let mut state = self.state.lock();
         let path = path.as_ref();
         let inode = state.next_inode;
@@ -556,8 +765,27 @@ impl FakeFs {
             }
             Ok(())
         })?;
-        state.emit_event(&[path]);
+        state.emit_event([path]);
         Ok(())
+    }
+
+    pub fn read_file_sync(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
+        let path = path.as_ref();
+        let path = normalize_path(path);
+        let state = self.state.lock();
+        let entry = state.read_path(&path)?;
+        let entry = entry.lock();
+        entry.file_content(&path).cloned()
+    }
+
+    async fn load_internal(&self, path: impl AsRef<Path>) -> Result<Vec<u8>> {
+        let path = path.as_ref();
+        let path = normalize_path(path);
+        self.simulate_random_delay().await;
+        let state = self.state.lock();
+        let entry = state.read_path(&path)?;
+        let entry = entry.lock();
+        entry.file_content(&path).cloned()
     }
 
     pub fn pause_events(&self) {
@@ -597,10 +825,34 @@ impl FakeFs {
                     self.create_dir(path).await.unwrap();
                 }
                 String(contents) => {
-                    self.insert_file(&path, contents).await;
+                    self.insert_file(&path, contents.into_bytes()).await;
                 }
                 _ => {
                     panic!("JSON object must contain only objects, strings, or null");
+                }
+            }
+        }
+        .boxed()
+    }
+
+    pub fn insert_tree_from_real_fs<'a>(
+        &'a self,
+        path: impl 'a + AsRef<Path> + Send,
+        src_path: impl 'a + AsRef<Path> + Send,
+    ) -> futures::future::BoxFuture<'a, ()> {
+        use futures::FutureExt as _;
+
+        async move {
+            let path = path.as_ref();
+            if std::fs::metadata(&src_path).unwrap().is_file() {
+                let contents = std::fs::read(src_path).unwrap();
+                self.insert_file(path, contents).await;
+            } else {
+                self.create_dir(path).await.unwrap();
+                for entry in std::fs::read_dir(&src_path).unwrap() {
+                    let entry = entry.unwrap();
+                    self.insert_tree_from_real_fs(&path.join(entry.file_name()), &entry.path())
+                        .await;
                 }
             }
         }
@@ -646,6 +898,17 @@ impl FakeFs {
         });
     }
 
+    pub fn set_blame_for_repo(&self, dot_git: &Path, blames: Vec<(&Path, git::blame::Blame)>) {
+        self.with_git_state(dot_git, true, |state| {
+            state.blames.clear();
+            state.blames.extend(
+                blames
+                    .into_iter()
+                    .map(|(path, blame)| (path.to_path_buf(), blame)),
+            );
+        });
+    }
+
     pub fn set_status_for_repo_via_working_copy_change(
         &self,
         dot_git: &Path,
@@ -656,7 +919,7 @@ impl FakeFs {
             state.worktree_statuses.extend(
                 statuses
                     .iter()
-                    .map(|(path, content)| ((**path).into(), content.clone())),
+                    .map(|(path, content)| ((**path).into(), *content)),
             );
         });
         self.state.lock().emit_event(
@@ -676,7 +939,7 @@ impl FakeFs {
             state.worktree_statuses.extend(
                 statuses
                     .iter()
-                    .map(|(path, content)| ((**path).into(), content.clone())),
+                    .map(|(path, content)| ((**path).into(), *content)),
             );
         });
     }
@@ -767,7 +1030,7 @@ impl FakeFsEntry {
         matches!(self, Self::Symlink { .. })
     }
 
-    fn file_content(&self, path: &Path) -> Result<&String> {
+    fn file_content(&self, path: &Path) -> Result<&Vec<u8>> {
         if let Self::File { content, .. } = self {
             Ok(content)
         } else {
@@ -775,7 +1038,7 @@ impl FakeFsEntry {
         }
     }
 
-    fn set_file_content(&mut self, path: &Path, new_content: String) -> Result<()> {
+    fn set_file_content(&mut self, path: &Path, new_content: Vec<u8>) -> Result<()> {
         if let Self::File { content, mtime, .. } = self {
             *mtime = SystemTime::now();
             *content = new_content;
@@ -844,7 +1107,7 @@ impl Fs for FakeFs {
         let file = Arc::new(Mutex::new(FakeFsEntry::File {
             inode,
             mtime,
-            content: String::new(),
+            content: Vec::new(),
         }));
         state.write_path(path, |entry| {
             match entry {
@@ -861,7 +1124,90 @@ impl Fs for FakeFs {
             }
             Ok(())
         })?;
+        state.emit_event([path]);
+        Ok(())
+    }
+
+    async fn create_symlink(&self, path: &Path, target: PathBuf) -> Result<()> {
+        let mut state = self.state.lock();
+        let file = Arc::new(Mutex::new(FakeFsEntry::Symlink { target }));
+        state
+            .write_path(path.as_ref(), move |e| match e {
+                btree_map::Entry::Vacant(e) => {
+                    e.insert(file);
+                    Ok(())
+                }
+                btree_map::Entry::Occupied(mut e) => {
+                    *e.get_mut() = file;
+                    Ok(())
+                }
+            })
+            .unwrap();
         state.emit_event(&[path]);
+        Ok(())
+    }
+
+    async fn create_file_with(
+        &self,
+        path: &Path,
+        mut content: Pin<&mut (dyn AsyncRead + Send)>,
+    ) -> Result<()> {
+        let mut bytes = Vec::new();
+        content.read_to_end(&mut bytes).await?;
+        self.write_file_internal(path, bytes)?;
+        Ok(())
+    }
+
+    async fn extract_tar_gz_file(
+        &self,
+        path: &Path,
+        content: Pin<&mut (dyn AsyncRead + Send)>,
+    ) -> Result<()> {
+        let body = async_compression::futures::bufread::GzipDecoder::new(
+            futures::io::BufReader::new(content),
+        );
+        let content = async_tar::Archive::new(body);
+        let mut entries = content.entries()?;
+        while let Some(entry) = entries.next().await {
+            let mut entry = entry?;
+            if entry.header().entry_type().is_file() {
+                let path = path.join(entry.path()?.as_ref());
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).await?;
+                self.create_dir(path.parent().unwrap()).await?;
+                self.write_file_internal(&path, bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn extract_zip_file(
+        &self,
+        dst: &Path,
+        content: Pin<&mut (dyn AsyncRead + Send)>,
+    ) -> Result<()> {
+        let mut reader =
+            async_zip::base::read::stream::ZipFileReader::new(futures::io::BufReader::new(content));
+
+        let dst = &dst.canonicalize().unwrap_or_else(|_| dst.to_path_buf());
+        while let Some(mut item) = reader.next_with_entry().await? {
+            let entry_reader = item.reader_mut();
+            let entry = entry_reader.entry();
+            let path = dst.join(entry.filename().as_str().unwrap());
+
+            if entry.dir().unwrap() {
+                self.create_dir(&path).await?;
+            } else {
+                let parent_dir = path.parent().expect("failed to get parent directory");
+                self.create_dir(parent_dir).await?;
+                let mut bytes = Vec::new();
+                entry_reader.read_to_end(&mut bytes).await?;
+                self.write_file_internal(&path, bytes)?;
+            }
+
+            reader = item.skip().await?;
+        }
+
         Ok(())
     }
 
@@ -935,7 +1281,7 @@ impl Fs for FakeFs {
                 e.insert(Arc::new(Mutex::new(FakeFsEntry::File {
                     inode,
                     mtime,
-                    content: String::new(),
+                    content: Vec::new(),
                 })))
                 .clone(),
             )),
@@ -1014,35 +1360,30 @@ impl Fs for FakeFs {
     }
 
     async fn open_sync(&self, path: &Path) -> Result<Box<dyn io::Read>> {
-        let text = self.load(path).await?;
-        Ok(Box::new(io::Cursor::new(text)))
+        let bytes = self.load_internal(path).await?;
+        Ok(Box::new(io::Cursor::new(bytes)))
     }
 
     async fn load(&self, path: &Path) -> Result<String> {
-        let path = normalize_path(path);
-        self.simulate_random_delay().await;
-        let state = self.state.lock();
-        let entry = state.read_path(&path)?;
-        let entry = entry.lock();
-        entry.file_content(&path).cloned()
+        let content = self.load_internal(path).await?;
+        Ok(String::from_utf8(content.clone())?)
     }
 
     async fn atomic_write(&self, path: PathBuf, data: String) -> Result<()> {
         self.simulate_random_delay().await;
         let path = normalize_path(path.as_path());
-        self.write_file_internal(path, data.to_string())?;
-
+        self.write_file_internal(path, data.into_bytes())?;
         Ok(())
     }
 
     async fn save(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()> {
         self.simulate_random_delay().await;
         let path = normalize_path(path);
-        let content = chunks(text, line_ending).collect();
+        let content = chunks(text, line_ending).collect::<String>();
         if let Some(path) = path.parent() {
             self.create_dir(path).await?;
         }
-        self.write_file_internal(path, content)?;
+        self.write_file_internal(path, content.into_bytes())?;
         Ok(())
     }
 
@@ -1066,6 +1407,12 @@ impl Fs for FakeFs {
         } else {
             false
         }
+    }
+
+    async fn is_dir(&self, path: &Path) -> bool {
+        self.metadata(path)
+            .await
+            .is_ok_and(|metadata| metadata.is_some_and(|metadata| metadata.is_dir))
     }
 
     async fn metadata(&self, path: &Path) -> Result<Option<Metadata>> {
@@ -1142,14 +1489,14 @@ impl Fs for FakeFs {
         &self,
         path: &Path,
         _: Duration,
-    ) -> Pin<Box<dyn Send + Stream<Item = Vec<fsevent::Event>>>> {
+    ) -> Pin<Box<dyn Send + Stream<Item = Vec<PathBuf>>>> {
         self.simulate_random_delay().await;
         let (tx, rx) = smol::channel::unbounded();
         self.state.lock().event_txs.push(tx);
         let path = path.to_path_buf();
         let executor = self.executor.clone();
         Box::pin(futures::StreamExt::filter(rx, move |events| {
-            let result = events.iter().any(|event| event.path.starts_with(&path));
+            let result = events.iter().any(|evt_path| evt_path.starts_with(&path));
             let executor = executor.clone();
             async move {
                 executor.simulate_random_delay().await;
@@ -1166,7 +1513,7 @@ impl Fs for FakeFs {
             let state = git_repo_state
                 .get_or_insert_with(|| Arc::new(Mutex::new(FakeGitRepositoryState::default())))
                 .clone();
-            Some(repository::FakeGitRepository::open(state))
+            Some(git::repository::FakeGitRepository::open(state))
         } else {
             None
         }
@@ -1174,6 +1521,10 @@ impl Fs for FakeFs {
 
     fn is_fake(&self) -> bool {
         true
+    }
+
+    async fn is_case_sensitive(&self) -> Result<bool> {
+        Ok(true)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1274,6 +1625,38 @@ pub fn copy_recursive<'a>(
     .boxed()
 }
 
+// todo(windows)
+// can we get file id not open the file twice?
+// https://github.com/rust-lang/rust/issues/63010
+#[cfg(target_os = "windows")]
+async fn file_id(path: impl AsRef<Path>) -> Result<u64> {
+    use std::os::windows::io::AsRawHandle;
+
+    use smol::fs::windows::OpenOptionsExt;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS,
+        },
+    };
+
+    let file = smol::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(path)
+        .await?;
+
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle
+    // This function supports Windows XP+
+    smol::unblock(move || {
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle() as _), &mut info)? };
+
+        Ok(((info.nFileIndexHigh as u64) << 32) | (info.nFileIndexLow as u64))
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1310,8 +1693,9 @@ mod tests {
             ]
         );
 
-        fs.insert_symlink("/root/dir2/link-to-dir3", "./dir3".into())
-            .await;
+        fs.create_symlink("/root/dir2/link-to-dir3".as_ref(), "./dir3".into())
+            .await
+            .unwrap();
 
         assert_eq!(
             fs.canonicalize("/root/dir2/link-to-dir3".as_ref())

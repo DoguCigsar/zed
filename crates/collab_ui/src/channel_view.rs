@@ -1,9 +1,9 @@
 use anyhow::Result;
 use call::report_call_event_for_channel;
-use channel::{Channel, ChannelBuffer, ChannelBufferEvent, ChannelId, ChannelStore};
+use channel::{Channel, ChannelBuffer, ChannelBufferEvent, ChannelStore};
 use client::{
     proto::{self, PeerId},
-    Collaborator, ParticipantIndex,
+    ChannelId, Collaborator, ParticipantIndex,
 };
 use collections::HashMap;
 use editor::{
@@ -22,8 +22,9 @@ use std::{
 };
 use ui::{prelude::*, Label};
 use util::ResultExt;
+use workspace::notifications::NotificationId;
 use workspace::{
-    item::{FollowableItem, Item, ItemEvent, ItemHandle},
+    item::{FollowableItem, Item, ItemEvent, ItemHandle, TabContentParams},
     register_followable_item,
     searchable::SearchableItemHandle,
     ItemNavHistory, Pane, SaveIntent, Toast, ViewId, Workspace, WorkspaceId,
@@ -171,10 +172,8 @@ impl ChannelView {
                 let this = this.clone();
                 Some(ui::ContextMenu::build(cx, move |menu, _| {
                     menu.entry("Copy link to section", None, move |cx| {
-                        this.update(cx, |this, cx| {
-                            this.copy_link_for_position(position.clone(), cx)
-                        })
-                        .ok();
+                        this.update(cx, |this, cx| this.copy_link_for_position(position, cx))
+                            .ok();
                     })
                 }))
             });
@@ -267,11 +266,19 @@ impl ChannelView {
             return;
         };
 
-        let link = channel.notes_link(closest_heading.map(|heading| heading.text));
+        let link = channel.notes_link(closest_heading.map(|heading| heading.text), cx);
         cx.write_to_clipboard(ClipboardItem::new(link));
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.show_toast(Toast::new(0, "Link copied to clipboard"), cx);
+                struct CopyLinkForPositionToast;
+
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<CopyLinkForPositionToast>(),
+                        "Link copied to clipboard",
+                    ),
+                    cx,
+                );
             })
             .ok();
     }
@@ -367,7 +374,7 @@ impl Item for ChannelView {
         }
     }
 
-    fn tab_content(&self, _: Option<usize>, selected: bool, cx: &WindowContext) -> AnyElement {
+    fn tab_content(&self, params: TabContentParams, cx: &WindowContext) -> AnyElement {
         let label = if let Some(channel) = self.channel(cx) {
             match (
                 self.channel_buffer.read(cx).buffer().read(cx).read_only(),
@@ -378,10 +385,10 @@ impl Item for ChannelView {
                 (_, false) => format!("#{} (disconnected)", channel.name),
             }
         } else {
-            format!("channel notes (disconnected)")
+            "channel notes (disconnected)".to_string()
         };
         Label::new(label)
-            .color(if selected {
+            .color(if params.selected {
                 Color::Default
             } else {
                 Color::Muted
@@ -454,7 +461,7 @@ impl FollowableItem for ChannelView {
 
         Some(proto::view::Variant::ChannelView(
             proto::view::ChannelView {
-                channel_id: channel_buffer.channel_id,
+                channel_id: channel_buffer.channel_id.0,
                 editor: if let Some(proto::view::Variant::Editor(proto)) =
                     self.editor.read(cx).to_state_proto(cx)
                 {
@@ -480,7 +487,8 @@ impl FollowableItem for ChannelView {
             unreachable!()
         };
 
-        let open = ChannelView::open_in_pane(state.channel_id, None, pane, workspace, cx);
+        let open =
+            ChannelView::open_in_pane(ChannelId(state.channel_id), None, pane, workspace, cx);
 
         Some(cx.spawn(|mut cx| async move {
             let this = open.await?;

@@ -12,7 +12,9 @@ use collections::HashSet;
 use futures::Future;
 use gpui::{View, ViewContext, VisualTestContext};
 use indoc::indoc;
-use language::{point_to_lsp, FakeLspAdapter, Language, LanguageConfig, LanguageQueries};
+use language::{
+    point_to_lsp, FakeLspAdapter, Language, LanguageConfig, LanguageMatcher, LanguageQueries,
+};
 use lsp::{notification, request};
 use multi_buffer::ToPointUtf16;
 use project::Project;
@@ -30,7 +32,7 @@ pub struct EditorLspTestContext {
 
 impl EditorLspTestContext {
     pub async fn new(
-        mut language: Language,
+        language: Language,
         capabilities: lsp::ServerCapabilities,
         cx: &mut gpui::TestAppContext,
     ) -> EditorLspTestContext {
@@ -51,16 +53,17 @@ impl EditorLspTestContext {
                 .expect("language must have a path suffix for EditorLspTestContext")
         );
 
-        let mut fake_servers = language
-            .set_fake_lsp_adapter(Arc::new(FakeLspAdapter {
-                capabilities,
-                ..Default::default()
-            }))
-            .await;
-
         let project = Project::test(app_state.fs.clone(), [], cx).await;
 
-        project.update(cx, |project, _| project.languages().add(Arc::new(language)));
+        let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+        let mut fake_servers = language_registry.register_fake_lsp_adapter(
+            language.name().as_ref(),
+            FakeLspAdapter {
+                capabilities,
+                ..Default::default()
+            },
+        );
+        language_registry.add(Arc::new(language));
 
         app_state
             .fs
@@ -115,7 +118,10 @@ impl EditorLspTestContext {
         let language = Language::new(
             LanguageConfig {
                 name: "Rust".into(),
-                path_suffixes: vec!["rs".to_string()],
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["rs".to_string()],
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             Some(tree_sitter_rust::language()),
@@ -160,7 +166,10 @@ impl EditorLspTestContext {
         let language = Language::new(
             LanguageConfig {
                 name: "Typescript".into(),
-                path_suffixes: vec!["ts".to_string()],
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["ts".to_string()],
+                    ..Default::default()
+                },
                 brackets: language::BracketPairConfig {
                     pairs: vec![language::BracketPair {
                         start: "{".to_string(),
@@ -204,6 +213,22 @@ impl EditorLspTestContext {
         .expect("Could not parse queries");
 
         Self::new(language, capabilities, cx).await
+    }
+
+    pub async fn new_html(cx: &mut gpui::TestAppContext) -> Self {
+        let language = Language::new(
+            LanguageConfig {
+                name: "HTML".into(),
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["html".into()],
+                    ..Default::default()
+                },
+                block_comment: Some(("<!-- ".into(), " -->".into())),
+                ..Default::default()
+            },
+            Some(tree_sitter_html::language()),
+        );
+        Self::new(language, Default::default(), cx).await
     }
 
     // Constructs lsp range using a marked string with '[', ']' range delimiters

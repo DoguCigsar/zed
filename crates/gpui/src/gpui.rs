@@ -6,8 +6,7 @@
 //! ## Getting Started
 //!
 //! GPUI is still in active development as we work on the Zed code editor and isn't yet on crates.io.
-//! You'll also need to use the latest version of stable rust and be on macOS. Add the following to your
-//! Cargo.toml:
+//! You'll also need to use the latest version of stable rust. Add the following to your Cargo.toml:
 //!
 //! ```
 //! gpui = { git = "https://github.com/zed-industries/zed" }
@@ -36,7 +35,7 @@
 //!
 //! - Low level, imperative UI with Elements. Elements are the building blocks of UI in GPUI, and they
 //!   provide a nice wrapper around an imperative API that provides as much flexibility and control as
-//!   you need. Elements have total control over how they and their child elements are rendered and and
+//!   you need. Elements have total control over how they and their child elements are rendered and
 //!   can be used for making efficient views into large lists, implement custom layouting for a code editor,
 //!   and anything else you can think of. See the [`element`] module for more information.
 //!
@@ -61,20 +60,23 @@
 //! and will be publishing more guides to GPUI on our [blog](https://zed.dev/blog).
 
 #![deny(missing_docs)]
-#![allow(clippy::type_complexity)]
+#![allow(clippy::type_complexity)] // Not useful, GPUI makes heavy use of callbacks
+#![allow(clippy::collapsible_else_if)] // False positives in platform specific code
+#![allow(unused_mut)] // False positives in platform specific code
 
 #[macro_use]
 mod action;
 mod app;
 
 mod arena;
+mod asset_cache;
 mod assets;
+mod bounds_tree;
 mod color;
 mod element;
 mod elements;
 mod executor;
 mod geometry;
-mod image_cache;
 mod input;
 mod interactive;
 mod key_dispatch;
@@ -115,6 +117,7 @@ pub use action::*;
 pub use anyhow::Result;
 pub use app::*;
 pub(crate) use arena::*;
+pub use asset_cache::*;
 pub use assets::*;
 pub use color::*;
 pub use ctor::ctor;
@@ -123,7 +126,6 @@ pub use elements::*;
 pub use executor::*;
 pub use geometry::*;
 pub use gpui_macros::{register_action, test, IntoElement, Render};
-use image_cache::*;
 pub use input::*;
 pub use interactive::*;
 use key_dispatch::*;
@@ -163,6 +165,19 @@ pub trait Context {
         build_model: impl FnOnce(&mut ModelContext<'_, T>) -> T,
     ) -> Self::Result<Model<T>>;
 
+    /// Reserve a slot for a model to be inserted later.
+    /// The returned [Reservation] allows you to obtain the [EntityId] for the future model.
+    fn reserve_model<T: 'static>(&mut self) -> Self::Result<Reservation<T>>;
+
+    /// Insert a new model in the app context based on a [Reservation] previously obtained from [`reserve_model`].
+    ///
+    /// [`reserve_model`]: Self::reserve_model
+    fn insert_model<T: 'static>(
+        &mut self,
+        reservation: Reservation<T>,
+        build_model: impl FnOnce(&mut ModelContext<'_, T>) -> T,
+    ) -> Self::Result<Model<T>>;
+
     /// Update a model in the app context.
     fn update_model<T, R>(
         &mut self,
@@ -194,6 +209,17 @@ pub trait Context {
     ) -> Result<R>
     where
         T: 'static;
+}
+
+/// Returned by [Context::reserve_model] to later be passed to [Context::insert_model].
+/// Allows you to obtain the [EntityId] for a model before it is created.
+pub struct Reservation<T>(pub(crate) Slot<T>);
+
+impl<T: 'static> Reservation<T> {
+    /// Returns the [EntityId] that will be associated with the model once it is inserted.
+    pub fn entity_id(&self) -> EntityId {
+        self.0.entity_id()
+    }
 }
 
 /// This trait is used for the different visual contexts in GPUI that
@@ -259,6 +285,10 @@ pub trait EventEmitter<E: Any>: 'static {}
 pub trait BorrowAppContext {
     /// Set a global value on the context.
     fn set_global<T: Global>(&mut self, global: T);
+    /// Updates the global state of the given type.
+    fn update_global<G, R>(&mut self, f: impl FnOnce(&mut G, &mut Self) -> R) -> R
+    where
+        G: Global;
 }
 
 impl<C> BorrowAppContext for C
@@ -267,6 +297,16 @@ where
 {
     fn set_global<G: Global>(&mut self, global: G) {
         self.borrow_mut().set_global(global)
+    }
+
+    fn update_global<G, R>(&mut self, f: impl FnOnce(&mut G, &mut Self) -> R) -> R
+    where
+        G: Global,
+    {
+        let mut global = self.borrow_mut().lease_global::<G>();
+        let result = f(&mut global, self);
+        self.borrow_mut().end_global_lease(global);
+        result
     }
 }
 
@@ -290,5 +330,12 @@ impl<T> Flatten<T> for Result<T> {
 
 /// A marker trait for types that can be stored in GPUI's global state.
 ///
+/// This trait exists to provide type-safe access to globals by restricting
+/// the scope from which they can be accessed. For instance, the actual type
+/// that implements [`Global`] can be private, with public accessor functions
+/// that enforce correct usage.
+///
 /// Implement this on types you want to store in the context as a global.
-pub trait Global: 'static {}
+pub trait Global: 'static {
+    // This trait is intentionally left empty, by virtue of being a marker trait.
+}

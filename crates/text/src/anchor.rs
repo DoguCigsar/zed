@@ -6,10 +6,13 @@ use anyhow::Result;
 use std::{cmp::Ordering, fmt::Debug, ops::Range};
 use sum_tree::Bias;
 
+/// A timestamped position in a buffer
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash, Default)]
 pub struct Anchor {
     pub timestamp: clock::Lamport,
+    /// The byte offset in the buffer
     pub offset: usize,
+    /// Describes which character the anchor is biased towards
     pub bias: Bias,
     pub buffer_id: Option<BufferId>,
 }
@@ -94,6 +97,8 @@ impl Anchor {
     pub fn is_valid(&self, buffer: &BufferSnapshot) -> bool {
         if *self == Anchor::MIN || *self == Anchor::MAX {
             true
+        } else if self.buffer_id != Some(buffer.remote_id) {
+            false
         } else {
             let fragment_id = buffer.fragment_id_for_anchor(self);
             let mut fragment_cursor = buffer.fragments.cursor::<(Option<&Locator>, usize)>();

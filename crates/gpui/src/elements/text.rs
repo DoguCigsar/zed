@@ -1,7 +1,7 @@
 use crate::{
-    ActiveTooltip, AnyTooltip, AnyView, Bounds, DispatchPhase, Element, ElementContext, ElementId,
-    HighlightStyle, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, SharedString, Size, TextRun, TextStyle, WhiteSpace, WindowContext, WrappedLine,
+    ActiveTooltip, AnyTooltip, AnyView, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
+    HighlightStyle, Hitbox, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, Point, SharedString, Size, TextRun, TextStyle, WhiteSpace, WindowContext, WrappedLine,
     TOOLTIP_DELAY,
 };
 use anyhow::anyhow;
@@ -17,29 +17,46 @@ use std::{
 use util::ResultExt;
 
 impl Element for &'static str {
-    type State = TextState;
+    type RequestLayoutState = TextState;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
 
     fn request_layout(
         &mut self,
-        _: Option<Self::State>,
-        cx: &mut ElementContext,
-    ) -> (LayoutId, Self::State) {
+        _id: Option<&GlobalElementId>,
+        cx: &mut WindowContext,
+    ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextState::default();
         let layout_id = state.layout(SharedString::from(*self), None, cx);
         (layout_id, state)
     }
 
-    fn paint(&mut self, bounds: Bounds<Pixels>, state: &mut TextState, cx: &mut ElementContext) {
-        state.paint(bounds, self, cx)
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _bounds: Bounds<Pixels>,
+        _text_state: &mut Self::RequestLayoutState,
+        _cx: &mut WindowContext,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        bounds: Bounds<Pixels>,
+        text_state: &mut TextState,
+        _: &mut (),
+        cx: &mut WindowContext,
+    ) {
+        text_state.paint(bounds, self, cx)
     }
 }
 
 impl IntoElement for &'static str {
     type Element = Self;
-
-    fn element_id(&self) -> Option<ElementId> {
-        None
-    }
 
     fn into_element(self) -> Self::Element {
         self
@@ -49,40 +66,55 @@ impl IntoElement for &'static str {
 impl IntoElement for String {
     type Element = SharedString;
 
-    fn element_id(&self) -> Option<ElementId> {
-        None
-    }
-
     fn into_element(self) -> Self::Element {
         self.into()
     }
 }
 
 impl Element for SharedString {
-    type State = TextState;
+    type RequestLayoutState = TextState;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
 
     fn request_layout(
         &mut self,
-        _: Option<Self::State>,
-        cx: &mut ElementContext,
-    ) -> (LayoutId, Self::State) {
+
+        _id: Option<&GlobalElementId>,
+
+        cx: &mut WindowContext,
+    ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextState::default();
         let layout_id = state.layout(self.clone(), None, cx);
         (layout_id, state)
     }
 
-    fn paint(&mut self, bounds: Bounds<Pixels>, state: &mut TextState, cx: &mut ElementContext) {
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _bounds: Bounds<Pixels>,
+        _text_state: &mut Self::RequestLayoutState,
+        _cx: &mut WindowContext,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        bounds: Bounds<Pixels>,
+        text_state: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        cx: &mut WindowContext,
+    ) {
         let text_str: &str = self.as_ref();
-        state.paint(bounds, text_str, cx)
+        text_state.paint(bounds, text_str, cx)
     }
 }
 
 impl IntoElement for SharedString {
     type Element = Self;
-
-    fn element_id(&self) -> Option<ElementId> {
-        None
-    }
 
     fn into_element(self) -> Self::Element {
         self
@@ -138,29 +170,48 @@ impl StyledText {
 }
 
 impl Element for StyledText {
-    type State = TextState;
+    type RequestLayoutState = TextState;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
 
     fn request_layout(
         &mut self,
-        _: Option<Self::State>,
-        cx: &mut ElementContext,
-    ) -> (LayoutId, Self::State) {
+
+        _id: Option<&GlobalElementId>,
+
+        cx: &mut WindowContext,
+    ) -> (LayoutId, Self::RequestLayoutState) {
         let mut state = TextState::default();
         let layout_id = state.layout(self.text.clone(), self.runs.take(), cx);
         (layout_id, state)
     }
 
-    fn paint(&mut self, bounds: Bounds<Pixels>, state: &mut Self::State, cx: &mut ElementContext) {
-        state.paint(bounds, &self.text, cx)
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _bounds: Bounds<Pixels>,
+        _state: &mut Self::RequestLayoutState,
+        _cx: &mut WindowContext,
+    ) {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        bounds: Bounds<Pixels>,
+        text_state: &mut Self::RequestLayoutState,
+        _: &mut Self::PrepaintState,
+        cx: &mut WindowContext,
+    ) {
+        text_state.paint(bounds, &self.text, cx)
     }
 }
 
 impl IntoElement for StyledText {
     type Element = Self;
-
-    fn element_id(&self) -> Option<crate::ElementId> {
-        None
-    }
 
     fn into_element(self) -> Self::Element {
         self
@@ -187,7 +238,7 @@ impl TextState {
         &mut self,
         text: SharedString,
         runs: Option<Vec<TextRun>>,
-        cx: &mut ElementContext,
+        cx: &mut WindowContext,
     ) -> LayoutId {
         let text_style = cx.text_style();
         let font_size = text_style.font_size.to_pixels(cx.rem_size());
@@ -262,7 +313,7 @@ impl TextState {
         layout_id
     }
 
-    fn paint(&mut self, bounds: Bounds<Pixels>, text: &str, cx: &mut ElementContext) {
+    fn paint(&mut self, bounds: Bounds<Pixels>, text: &str, cx: &mut WindowContext) {
         let element_state = self.lock();
         let element_state = element_state
             .as_ref()
@@ -324,8 +375,8 @@ struct InteractiveTextClickEvent {
 }
 
 #[doc(hidden)]
+#[derive(Default)]
 pub struct InteractiveTextState {
-    text_state: TextState,
     mouse_down_index: Rc<Cell<Option<usize>>>,
     hovered_index: Rc<Cell<Option<usize>>>,
     active_tooltip: Rc<RefCell<Option<ActiveTooltip>>>,
@@ -385,178 +436,201 @@ impl InteractiveText {
 }
 
 impl Element for InteractiveText {
-    type State = InteractiveTextState;
+    type RequestLayoutState = TextState;
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.element_id.clone())
+    }
 
     fn request_layout(
         &mut self,
-        state: Option<Self::State>,
-        cx: &mut ElementContext,
-    ) -> (LayoutId, Self::State) {
-        if let Some(InteractiveTextState {
-            mouse_down_index,
-            hovered_index,
-            active_tooltip,
-            ..
-        }) = state
-        {
-            let (layout_id, text_state) = self.text.request_layout(None, cx);
-            let element_state = InteractiveTextState {
-                text_state,
-                mouse_down_index,
-                hovered_index,
-                active_tooltip,
-            };
-            (layout_id, element_state)
-        } else {
-            let (layout_id, text_state) = self.text.request_layout(None, cx);
-            let element_state = InteractiveTextState {
-                text_state,
-                mouse_down_index: Rc::default(),
-                hovered_index: Rc::default(),
-                active_tooltip: Rc::default(),
-            };
-            (layout_id, element_state)
-        }
+        _id: Option<&GlobalElementId>,
+        cx: &mut WindowContext,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        self.text.request_layout(None, cx)
     }
 
-    fn paint(&mut self, bounds: Bounds<Pixels>, state: &mut Self::State, cx: &mut ElementContext) {
-        if let Some(click_listener) = self.click_listener.take() {
-            let mouse_position = cx.mouse_position();
-            if let Some(ix) = state.text_state.index_for_position(bounds, mouse_position) {
-                if self
-                    .clickable_ranges
-                    .iter()
-                    .any(|range| range.contains(&ix))
-                    && cx.was_top_layer(&mouse_position, cx.stacking_order())
-                {
-                    cx.set_cursor_style(crate::CursorStyle::PointingHand)
-                }
-            }
+    fn prepaint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut Self::RequestLayoutState,
+        cx: &mut WindowContext,
+    ) -> Hitbox {
+        cx.with_optional_element_state::<InteractiveTextState, _>(
+            global_id,
+            |interactive_state, cx| {
+                let interactive_state = interactive_state
+                    .map(|interactive_state| interactive_state.unwrap_or_default());
 
-            let text_state = state.text_state.clone();
-            let mouse_down = state.mouse_down_index.clone();
-            if let Some(mouse_down_index) = mouse_down.get() {
-                let clickable_ranges = mem::take(&mut self.clickable_ranges);
-                cx.on_mouse_event(move |event: &MouseUpEvent, phase, cx| {
-                    if phase == DispatchPhase::Bubble {
-                        if let Some(mouse_up_index) =
-                            text_state.index_for_position(bounds, event.position)
-                        {
-                            click_listener(
-                                &clickable_ranges,
-                                InteractiveTextClickEvent {
-                                    mouse_down_index,
-                                    mouse_up_index,
-                                },
-                                cx,
-                            )
-                        }
-
-                        mouse_down.take();
-                        cx.refresh();
-                    }
-                });
-            } else {
-                cx.on_mouse_event(move |event: &MouseDownEvent, phase, cx| {
-                    if phase == DispatchPhase::Bubble {
-                        if let Some(mouse_down_index) =
-                            text_state.index_for_position(bounds, event.position)
-                        {
-                            mouse_down.set(Some(mouse_down_index));
-                            cx.refresh();
+                if let Some(interactive_state) = interactive_state.as_ref() {
+                    if let Some(active_tooltip) = interactive_state.active_tooltip.borrow().as_ref()
+                    {
+                        if let Some(tooltip) = active_tooltip.tooltip.clone() {
+                            cx.set_tooltip(tooltip);
                         }
                     }
-                });
-            }
-        }
-        if let Some(hover_listener) = self.hover_listener.take() {
-            let text_state = state.text_state.clone();
-            let hovered_index = state.hovered_index.clone();
-            cx.on_mouse_event(move |event: &MouseMoveEvent, phase, cx| {
-                if phase == DispatchPhase::Bubble {
-                    let current = hovered_index.get();
-                    let updated = text_state.index_for_position(bounds, event.position);
-                    if current != updated {
-                        hovered_index.set(updated);
-                        hover_listener(updated, event.clone(), cx);
-                        cx.refresh();
+                }
+
+                self.text.prepaint(None, bounds, state, cx);
+                let hitbox = cx.insert_hitbox(bounds, false);
+                (hitbox, interactive_state)
+            },
+        )
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        bounds: Bounds<Pixels>,
+        text_state: &mut Self::RequestLayoutState,
+        hitbox: &mut Hitbox,
+        cx: &mut WindowContext,
+    ) {
+        cx.with_element_state::<InteractiveTextState, _>(
+            global_id.unwrap(),
+            |interactive_state, cx| {
+                let mut interactive_state = interactive_state.unwrap_or_default();
+                if let Some(click_listener) = self.click_listener.take() {
+                    let mouse_position = cx.mouse_position();
+                    if let Some(ix) = text_state.index_for_position(bounds, mouse_position) {
+                        if self
+                            .clickable_ranges
+                            .iter()
+                            .any(|range| range.contains(&ix))
+                        {
+                            cx.set_cursor_style(crate::CursorStyle::PointingHand, hitbox)
+                        }
                     }
-                }
-            });
-        }
-        if let Some(tooltip_builder) = self.tooltip_builder.clone() {
-            let active_tooltip = state.active_tooltip.clone();
-            let pending_mouse_down = state.mouse_down_index.clone();
-            let text_state = state.text_state.clone();
 
-            cx.on_mouse_event(move |event: &MouseMoveEvent, phase, cx| {
-                let position = text_state.index_for_position(bounds, event.position);
-                let is_hovered = position.is_some() && pending_mouse_down.get().is_none();
-                if !is_hovered {
-                    active_tooltip.take();
-                    return;
-                }
-                let position = position.unwrap();
+                    let text_state = text_state.clone();
+                    let mouse_down = interactive_state.mouse_down_index.clone();
+                    if let Some(mouse_down_index) = mouse_down.get() {
+                        let hitbox = hitbox.clone();
+                        let clickable_ranges = mem::take(&mut self.clickable_ranges);
+                        cx.on_mouse_event(move |event: &MouseUpEvent, phase, cx| {
+                            if phase == DispatchPhase::Bubble && hitbox.is_hovered(cx) {
+                                if let Some(mouse_up_index) =
+                                    text_state.index_for_position(bounds, event.position)
+                                {
+                                    click_listener(
+                                        &clickable_ranges,
+                                        InteractiveTextClickEvent {
+                                            mouse_down_index,
+                                            mouse_up_index,
+                                        },
+                                        cx,
+                                    )
+                                }
 
-                if phase != DispatchPhase::Bubble {
-                    return;
-                }
-
-                if active_tooltip.borrow().is_none() {
-                    let task = cx.spawn({
-                        let active_tooltip = active_tooltip.clone();
-                        let tooltip_builder = tooltip_builder.clone();
-
-                        move |mut cx| async move {
-                            cx.background_executor().timer(TOOLTIP_DELAY).await;
-                            cx.update(|cx| {
-                                let new_tooltip =
-                                    tooltip_builder(position, cx).map(|tooltip| ActiveTooltip {
-                                        tooltip: Some(AnyTooltip {
-                                            view: tooltip,
-                                            cursor_offset: cx.mouse_position(),
-                                        }),
-                                        _task: None,
-                                    });
-                                *active_tooltip.borrow_mut() = new_tooltip;
+                                mouse_down.take();
                                 cx.refresh();
-                            })
-                            .ok();
+                            }
+                        });
+                    } else {
+                        let hitbox = hitbox.clone();
+                        cx.on_mouse_event(move |event: &MouseDownEvent, phase, cx| {
+                            if phase == DispatchPhase::Bubble && hitbox.is_hovered(cx) {
+                                if let Some(mouse_down_index) =
+                                    text_state.index_for_position(bounds, event.position)
+                                {
+                                    mouse_down.set(Some(mouse_down_index));
+                                    cx.refresh();
+                                }
+                            }
+                        });
+                    }
+                }
+
+                cx.on_mouse_event({
+                    let mut hover_listener = self.hover_listener.take();
+                    let hitbox = hitbox.clone();
+                    let text_state = text_state.clone();
+                    let hovered_index = interactive_state.hovered_index.clone();
+                    move |event: &MouseMoveEvent, phase, cx| {
+                        if phase == DispatchPhase::Bubble && hitbox.is_hovered(cx) {
+                            let current = hovered_index.get();
+                            let updated = text_state.index_for_position(bounds, event.position);
+                            if current != updated {
+                                hovered_index.set(updated);
+                                if let Some(hover_listener) = hover_listener.as_ref() {
+                                    hover_listener(updated, event.clone(), cx);
+                                }
+                                cx.refresh();
+                            }
+                        }
+                    }
+                });
+
+                if let Some(tooltip_builder) = self.tooltip_builder.clone() {
+                    let hitbox = hitbox.clone();
+                    let active_tooltip = interactive_state.active_tooltip.clone();
+                    let pending_mouse_down = interactive_state.mouse_down_index.clone();
+                    let text_state = text_state.clone();
+
+                    cx.on_mouse_event(move |event: &MouseMoveEvent, phase, cx| {
+                        let position = text_state.index_for_position(bounds, event.position);
+                        let is_hovered = position.is_some()
+                            && hitbox.is_hovered(cx)
+                            && pending_mouse_down.get().is_none();
+                        if !is_hovered {
+                            active_tooltip.take();
+                            return;
+                        }
+                        let position = position.unwrap();
+
+                        if phase != DispatchPhase::Bubble {
+                            return;
+                        }
+
+                        if active_tooltip.borrow().is_none() {
+                            let task = cx.spawn({
+                                let active_tooltip = active_tooltip.clone();
+                                let tooltip_builder = tooltip_builder.clone();
+
+                                move |mut cx| async move {
+                                    cx.background_executor().timer(TOOLTIP_DELAY).await;
+                                    cx.update(|cx| {
+                                        let new_tooltip =
+                                            tooltip_builder(position, cx).map(|tooltip| {
+                                                ActiveTooltip {
+                                                    tooltip: Some(AnyTooltip {
+                                                        view: tooltip,
+                                                        mouse_position: cx.mouse_position(),
+                                                    }),
+                                                    _task: None,
+                                                }
+                                            });
+                                        *active_tooltip.borrow_mut() = new_tooltip;
+                                        cx.refresh();
+                                    })
+                                    .ok();
+                                }
+                            });
+                            *active_tooltip.borrow_mut() = Some(ActiveTooltip {
+                                tooltip: None,
+                                _task: Some(task),
+                            });
                         }
                     });
-                    *active_tooltip.borrow_mut() = Some(ActiveTooltip {
-                        tooltip: None,
-                        _task: Some(task),
+
+                    let active_tooltip = interactive_state.active_tooltip.clone();
+                    cx.on_mouse_event(move |_: &MouseDownEvent, _, _| {
+                        active_tooltip.take();
                     });
                 }
-            });
 
-            let active_tooltip = state.active_tooltip.clone();
-            cx.on_mouse_event(move |_: &MouseDownEvent, _, _| {
-                active_tooltip.take();
-            });
+                self.text.paint(None, bounds, text_state, &mut (), cx);
 
-            if let Some(tooltip) = state
-                .active_tooltip
-                .clone()
-                .borrow()
-                .as_ref()
-                .and_then(|at| at.tooltip.clone())
-            {
-                cx.set_tooltip(tooltip);
-            }
-        }
-
-        self.text.paint(bounds, &mut state.text_state, cx)
+                ((), interactive_state)
+            },
+        );
     }
 }
 
 impl IntoElement for InteractiveText {
     type Element = Self;
-
-    fn element_id(&self) -> Option<ElementId> {
-        Some(self.element_id.clone())
-    }
 
     fn into_element(self) -> Self::Element {
         self

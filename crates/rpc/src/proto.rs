@@ -8,6 +8,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use prost::Message as _;
 use serde::Serialize;
 use std::any::{Any, TypeId};
+use std::time::Instant;
 use std::{
     cmp,
     fmt::Debug,
@@ -148,7 +149,13 @@ messages!(
     (CallCanceled, Foreground),
     (CancelCall, Foreground),
     (ChannelMessageSent, Foreground),
+    (ChannelMessageUpdate, Foreground),
+    (CompleteWithLanguageModel, Background),
+    (ComputeEmbeddings, Background),
+    (ComputeEmbeddingsResponse, Background),
     (CopyProjectEntry, Foreground),
+    (CountTokensWithLanguageModel, Background),
+    (CountTokensResponse, Background),
     (CreateBufferForPeer, Foreground),
     (CreateChannel, Foreground),
     (CreateChannelResponse, Foreground),
@@ -158,7 +165,9 @@ messages!(
     (DeclineCall, Foreground),
     (DeleteChannel, Foreground),
     (DeleteNotification, Foreground),
+    (UpdateNotification, Foreground),
     (DeleteProjectEntry, Foreground),
+    (EndStream, Foreground),
     (Error, Foreground),
     (ExpandProjectEntry, Foreground),
     (ExpandProjectEntryResponse, Foreground),
@@ -167,6 +176,8 @@ messages!(
     (FormatBuffers, Foreground),
     (FormatBuffersResponse, Foreground),
     (FuzzySearchUsers, Foreground),
+    (GetCachedEmbeddings, Background),
+    (GetCachedEmbeddingsResponse, Background),
     (GetChannelMembers, Foreground),
     (GetChannelMembersResponse, Foreground),
     (GetChannelMessages, Background),
@@ -190,8 +201,12 @@ messages!(
     (GetProjectSymbolsResponse, Background),
     (GetReferences, Background),
     (GetReferencesResponse, Background),
+    (GetSupermavenApiKey, Background),
+    (GetSupermavenApiKeyResponse, Background),
     (GetTypeDefinition, Background),
     (GetTypeDefinitionResponse, Background),
+    (GetImplementation, Background),
+    (GetImplementationResponse, Background),
     (GetUsers, Foreground),
     (Hello, Foreground),
     (IncomingCall, Foreground),
@@ -204,9 +219,11 @@ messages!(
     (JoinChannelChat, Foreground),
     (JoinChannelChatResponse, Foreground),
     (JoinProject, Foreground),
+    (JoinHostedProject, Foreground),
     (JoinProjectResponse, Foreground),
     (JoinRoom, Foreground),
     (JoinRoomResponse, Foreground),
+    (LanguageModelResponse, Background),
     (LeaveChannelBuffer, Background),
     (LeaveChannelChat, Foreground),
     (LeaveProject, Foreground),
@@ -235,6 +252,7 @@ messages!(
     (ReloadBuffersResponse, Foreground),
     (RemoveChannelMember, Foreground),
     (RemoveChannelMessage, Foreground),
+    (UpdateChannelMessage, Foreground),
     (RemoveContact, Foreground),
     (RemoveProjectCollaborator, Foreground),
     (RenameChannel, Foreground),
@@ -285,6 +303,30 @@ messages!(
     (LspExtExpandMacro, Background),
     (LspExtExpandMacroResponse, Background),
     (SetRoomParticipantRole, Foreground),
+    (BlameBuffer, Foreground),
+    (BlameBufferResponse, Foreground),
+    (CreateDevServerProject, Background),
+    (CreateDevServerProjectResponse, Foreground),
+    (CreateDevServer, Foreground),
+    (CreateDevServerResponse, Foreground),
+    (DevServerInstructions, Foreground),
+    (ShutdownDevServer, Foreground),
+    (ReconnectDevServer, Foreground),
+    (ReconnectDevServerResponse, Foreground),
+    (ShareDevServerProject, Foreground),
+    (JoinDevServerProject, Foreground),
+    (RejoinRemoteProjects, Foreground),
+    (RejoinRemoteProjectsResponse, Foreground),
+    (MultiLspQuery, Background),
+    (MultiLspQueryResponse, Background),
+    (DevServerProjectsUpdate, Foreground),
+    (ValidateDevServerProjectRequest, Background),
+    (DeleteDevServer, Foreground),
+    (DeleteDevServerProject, Foreground),
+    (RegenerateDevServerToken, Foreground),
+    (RegenerateDevServerTokenResponse, Foreground),
+    (RenameDevServer, Foreground),
+    (OpenNewBuffer, Foreground)
 );
 
 request_messages!(
@@ -296,6 +338,9 @@ request_messages!(
     (Call, Ack),
     (CancelCall, Ack),
     (CopyProjectEntry, ProjectEntryResponse),
+    (CompleteWithLanguageModel, LanguageModelResponse),
+    (ComputeEmbeddings, ComputeEmbeddingsResponse),
+    (CountTokensWithLanguageModel, CountTokensResponse),
     (CreateChannel, CreateChannelResponse),
     (CreateProjectEntry, ProjectEntryResponse),
     (CreateRoom, CreateRoomResponse),
@@ -306,18 +351,21 @@ request_messages!(
     (Follow, FollowResponse),
     (FormatBuffers, FormatBuffersResponse),
     (FuzzySearchUsers, UsersResponse),
+    (GetCachedEmbeddings, GetCachedEmbeddingsResponse),
     (GetChannelMembers, GetChannelMembersResponse),
     (GetChannelMessages, GetChannelMessagesResponse),
     (GetChannelMessagesById, GetChannelMessagesResponse),
     (GetCodeActions, GetCodeActionsResponse),
     (GetCompletions, GetCompletionsResponse),
     (GetDefinition, GetDefinitionResponse),
+    (GetImplementation, GetImplementationResponse),
     (GetDocumentHighlights, GetDocumentHighlightsResponse),
     (GetHover, GetHoverResponse),
     (GetNotifications, GetNotificationsResponse),
     (GetPrivateUserInfo, GetPrivateUserInfoResponse),
     (GetProjectSymbols, GetProjectSymbolsResponse),
     (GetReferences, GetReferencesResponse),
+    (GetSupermavenApiKey, GetSupermavenApiKeyResponse),
     (GetTypeDefinition, GetTypeDefinitionResponse),
     (GetUsers, UsersResponse),
     (IncomingCall, Ack),
@@ -326,6 +374,7 @@ request_messages!(
     (JoinChannel, JoinRoomResponse),
     (JoinChannelBuffer, JoinChannelBufferResponse),
     (JoinChannelChat, JoinChannelChatResponse),
+    (JoinHostedProject, JoinProjectResponse),
     (JoinProject, JoinProjectResponse),
     (JoinRoom, JoinRoomResponse),
     (LeaveChannelBuffer, Ack),
@@ -336,6 +385,7 @@ request_messages!(
     (OpenBufferById, OpenBufferResponse),
     (OpenBufferByPath, OpenBufferResponse),
     (OpenBufferForSymbol, OpenBufferForSymbolResponse),
+    (OpenNewBuffer, OpenBufferResponse),
     (PerformRename, PerformRenameResponse),
     (Ping, Ack),
     (PrepareRename, PrepareRenameResponse),
@@ -345,6 +395,7 @@ request_messages!(
     (ReloadBuffers, ReloadBuffersResponse),
     (RemoveChannelMember, Ack),
     (RemoveChannelMessage, Ack),
+    (UpdateChannelMessage, Ack),
     (RemoveContact, Ack),
     (RenameChannel, RenameChannelResponse),
     (RenameProjectEntry, ProjectEntryResponse),
@@ -370,6 +421,20 @@ request_messages!(
     (UpdateWorktree, Ack),
     (LspExtExpandMacro, LspExtExpandMacroResponse),
     (SetRoomParticipantRole, Ack),
+    (BlameBuffer, BlameBufferResponse),
+    (CreateDevServerProject, CreateDevServerProjectResponse),
+    (CreateDevServer, CreateDevServerResponse),
+    (ShutdownDevServer, Ack),
+    (ShareDevServerProject, ShareProjectResponse),
+    (JoinDevServerProject, JoinProjectResponse),
+    (RejoinRemoteProjects, RejoinRemoteProjectsResponse),
+    (ReconnectDevServer, ReconnectDevServerResponse),
+    (ValidateDevServerProjectRequest, Ack),
+    (MultiLspQuery, MultiLspQueryResponse),
+    (DeleteDevServer, Ack),
+    (DeleteDevServerProject, Ack),
+    (RegenerateDevServerToken, RegenerateDevServerTokenResponse),
+    (RenameDevServer, Ack)
 );
 
 entity_messages!(
@@ -377,6 +442,7 @@ entity_messages!(
     AddProjectCollaborator,
     ApplyCodeAction,
     ApplyCompletionAdditionalEdits,
+    BlameBuffer,
     BufferReloaded,
     BufferSaved,
     CopyProjectEntry,
@@ -388,6 +454,7 @@ entity_messages!(
     GetCodeActions,
     GetCompletions,
     GetDefinition,
+    GetImplementation,
     GetDocumentHighlights,
     GetHover,
     GetProjectSymbols,
@@ -396,7 +463,9 @@ entity_messages!(
     InlayHints,
     JoinProject,
     LeaveProject,
+    MultiLspQuery,
     OnTypeFormatting,
+    OpenNewBuffer,
     OpenBufferById,
     OpenBufferByPath,
     OpenBufferForSymbol,
@@ -428,7 +497,9 @@ entity_messages!(
 entity_messages!(
     {channel_id, Channel},
     ChannelMessageSent,
+    ChannelMessageUpdate,
     RemoveChannelMessage,
+    UpdateChannelMessage,
     UpdateChannelBuffer,
     UpdateChannelBufferCollaborators,
 );
@@ -509,8 +580,9 @@ impl<S> MessageStream<S>
 where
     S: futures::Stream<Item = Result<WebSocketMessage, anyhow::Error>> + Unpin,
 {
-    pub async fn read(&mut self) -> Result<Message, anyhow::Error> {
+    pub async fn read(&mut self) -> Result<(Message, Instant), anyhow::Error> {
         while let Some(bytes) = self.stream.next().await {
+            let received_at = Instant::now();
             match bytes? {
                 WebSocketMessage::Binary(bytes) => {
                     zstd::stream::copy_decode(bytes.as_slice(), &mut self.encoding_buffer).unwrap();
@@ -519,10 +591,10 @@ where
 
                     self.encoding_buffer.clear();
                     self.encoding_buffer.shrink_to(MAX_BUFFER_LEN);
-                    return Ok(Message::Envelope(envelope));
+                    return Ok((Message::Envelope(envelope), received_at));
                 }
-                WebSocketMessage::Ping(_) => return Ok(Message::Ping),
-                WebSocketMessage::Pong(_) => return Ok(Message::Pong),
+                WebSocketMessage::Ping(_) => return Ok((Message::Ping, received_at)),
+                WebSocketMessage::Pong(_) => return Ok((Message::Pong, received_at)),
                 WebSocketMessage::Close(_) => break,
                 _ => {}
             }

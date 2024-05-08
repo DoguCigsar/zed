@@ -24,12 +24,9 @@ mod tab_map;
 mod wrap_map;
 
 use crate::EditorStyle;
-use crate::{
-    hover_links::InlayHighlight, movement::TextLayoutDetails, Anchor, AnchorRangeExt, InlayId,
-    MultiBuffer, MultiBufferSnapshot, ToOffset, ToPoint,
-};
+use crate::{hover_links::InlayHighlight, movement::TextLayoutDetails, InlayId};
 pub use block_map::{BlockMap, BlockPoint};
-use collections::{BTreeMap, HashMap, HashSet};
+use collections::{HashMap, HashSet};
 use fold_map::FoldMap;
 use gpui::{Font, HighlightStyle, Hsla, LineLayout, Model, ModelContext, Pixels, UnderlineStyle};
 use inlay_map::InlayMap;
@@ -37,6 +34,7 @@ use language::{
     language_settings::language_settings, OffsetUtf16, Point, Subscription as BufferSubscription,
 };
 use lsp::DiagnosticSeverity;
+use multi_buffer::{Anchor, AnchorRangeExt, MultiBuffer, MultiBufferSnapshot, ToOffset, ToPoint};
 use std::{any::TypeId, borrow::Cow, fmt::Debug, num::NonZeroU32, ops::Range, sync::Arc};
 use sum_tree::{Bias, TreeMap};
 use tab_map::TabMap;
@@ -48,7 +46,7 @@ pub use block_map::{
     BlockDisposition, BlockId, BlockProperties, BlockStyle, RenderBlock, TransformBlock,
 };
 
-pub use self::fold_map::{Fold, FoldPoint};
+pub use self::fold_map::{Fold, FoldId, FoldPoint};
 pub use self::inlay_map::{InlayOffset, InlayPoint};
 pub(crate) use inlay_map::Inlay;
 
@@ -65,17 +63,29 @@ pub trait ToDisplayPoint {
 }
 
 type TextHighlights = TreeMap<Option<TypeId>, Arc<(HighlightStyle, Vec<Range<Anchor>>)>>;
-type InlayHighlights = BTreeMap<TypeId, HashMap<InlayId, (HighlightStyle, InlayHighlight)>>;
+type InlayHighlights = TreeMap<TypeId, TreeMap<InlayId, (HighlightStyle, InlayHighlight)>>;
 
+/// Decides how text in a [`MultiBuffer`] should be displayed in a buffer, handling inlay hints,
+/// folding, hard tabs, soft wrapping, custom blocks (like diagnostics), and highlighting.
+///
+/// See the [module level documentation](self) for more information.
 pub struct DisplayMap {
+    /// The buffer that we are displaying.
     buffer: Model<MultiBuffer>,
     buffer_subscription: BufferSubscription,
-    fold_map: FoldMap,
+    /// Decides where the [`Inlay`]s should be displayed.
     inlay_map: InlayMap,
+    /// Decides where the fold indicators should be and tracks parts of a source file that are currently folded.
+    fold_map: FoldMap,
+    /// Keeps track of hard tabs in a buffer.
     tab_map: TabMap,
+    /// Handles soft wrapping.
     wrap_map: Model<WrapMap>,
+    /// Tracks custom blocks such as diagnostics that should be displayed within buffer.
     block_map: BlockMap,
+    /// Regions of text that should be highlighted.
     text_highlights: TextHighlights,
+    /// Regions of inlays that should be highlighted.
     inlay_highlights: InlayHighlights,
     pub clip_at_line_ends: bool,
 }
@@ -247,10 +257,15 @@ impl DisplayMap {
         style: HighlightStyle,
     ) {
         for highlight in highlights {
-            self.inlay_highlights
-                .entry(type_id)
-                .or_default()
-                .insert(highlight.inlay, (style, highlight));
+            let update = self.inlay_highlights.update(&type_id, |highlights| {
+                highlights.insert(highlight.inlay, (style, highlight.clone()))
+            });
+            if update.is_none() {
+                self.inlay_highlights.insert(
+                    type_id,
+                    TreeMap::from_ordered_entries([(highlight.inlay, (style, highlight))]),
+                );
+            }
         }
     }
 
@@ -316,7 +331,7 @@ impl DisplayMap {
             .read(cx)
             .as_singleton()
             .and_then(|buffer| buffer.read(cx).language());
-        language_settings(language.as_deref(), None, cx).tab_size
+        language_settings(language, None, cx).tab_size
     }
 
     #[cfg(test)]
@@ -329,8 +344,13 @@ impl DisplayMap {
 pub(crate) struct Highlights<'a> {
     pub text_highlights: Option<&'a TextHighlights>,
     pub inlay_highlights: Option<&'a InlayHighlights>,
-    pub inlay_highlight_style: Option<HighlightStyle>,
-    pub suggestion_highlight_style: Option<HighlightStyle>,
+    pub styles: HighlightStyles,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct HighlightStyles {
+    pub inlay_hint: Option<HighlightStyle>,
+    pub suggestion: Option<HighlightStyle>,
 }
 
 pub struct HighlightedChunk<'a> {
@@ -339,6 +359,7 @@ pub struct HighlightedChunk<'a> {
     pub is_tab: bool,
 }
 
+#[derive(Clone)]
 pub struct DisplaySnapshot {
     pub buffer_snapshot: MultiBufferSnapshot,
     pub fold_snapshot: fold_map::FoldSnapshot,
@@ -412,7 +433,10 @@ impl DisplaySnapshot {
         } else if range.start.row == self.max_buffer_row()
             || (range.end.column > 0 && range.end.row == self.max_buffer_row())
         {
-            Point::new(range.start.row - 1, self.line_len(range.start.row - 1))
+            Point::new(
+                range.start.row - 1,
+                self.buffer_snapshot.line_len(range.start.row - 1),
+            )
         } else {
             self.prev_line_boundary(range.start).0
         };
@@ -492,7 +516,7 @@ impl DisplaySnapshot {
 
     /// Returns text chunks starting at the end of the given display row in reverse until the start of the file
     pub fn reverse_text_chunks(&self, display_row: u32) -> impl Iterator<Item = &str> {
-        (0..=display_row).into_iter().rev().flat_map(|row| {
+        (0..=display_row).rev().flat_map(|row| {
             self.block_snapshot
                 .chunks(row..row + 1, false, Highlights::default())
                 .map(|h| h.text)
@@ -502,21 +526,19 @@ impl DisplaySnapshot {
         })
     }
 
-    pub fn chunks<'a>(
-        &'a self,
+    pub fn chunks(
+        &self,
         display_rows: Range<u32>,
         language_aware: bool,
-        inlay_highlight_style: Option<HighlightStyle>,
-        suggestion_highlight_style: Option<HighlightStyle>,
-    ) -> DisplayChunks<'a> {
+        highlight_styles: HighlightStyles,
+    ) -> DisplayChunks<'_> {
         self.block_snapshot.chunks(
             display_rows,
             language_aware,
             Highlights {
                 text_highlights: Some(&self.text_highlights),
                 inlay_highlights: Some(&self.inlay_highlights),
-                inlay_highlight_style,
-                suggestion_highlight_style,
+                styles: highlight_styles,
             },
         )
     }
@@ -530,8 +552,10 @@ impl DisplaySnapshot {
         self.chunks(
             display_rows,
             language_aware,
-            Some(editor_style.inlays_style),
-            Some(editor_style.suggestions_style),
+            HighlightStyles {
+                inlay_hint: Some(editor_style.inlay_hints_style),
+                suggestion: Some(editor_style.suggestions_style),
+            },
         )
         .map(|chunk| {
             let mut highlight_style = chunk
@@ -642,7 +666,7 @@ impl DisplaySnapshot {
         layout_line.closest_index_for_x(x) as u32
     }
 
-    pub fn chars_at(
+    pub fn display_chars_at(
         &self,
         mut point: DisplayPoint,
     ) -> impl Iterator<Item = (char, DisplayPoint)> + '_ {
@@ -669,60 +693,24 @@ impl DisplaySnapshot {
             })
     }
 
-    pub fn reverse_chars_at(
+    pub fn buffer_chars_at(&self, mut offset: usize) -> impl Iterator<Item = (char, usize)> + '_ {
+        self.buffer_snapshot.chars_at(offset).map(move |ch| {
+            let ret = (ch, offset);
+            offset += ch.len_utf8();
+            ret
+        })
+    }
+
+    pub fn reverse_buffer_chars_at(
         &self,
-        mut point: DisplayPoint,
-    ) -> impl Iterator<Item = (char, DisplayPoint)> + '_ {
-        point = DisplayPoint(self.block_snapshot.clip_point(point.0, Bias::Left));
-        self.reverse_text_chunks(point.row())
-            .flat_map(|chunk| chunk.chars().rev())
-            .skip_while({
-                let mut column = self.line_len(point.row());
-                if self.max_point().row() > point.row() {
-                    column += 1;
-                }
-
-                move |char| {
-                    let at_point = column <= point.column();
-                    column = column.saturating_sub(char.len_utf8() as u32);
-                    !at_point
-                }
-            })
+        mut offset: usize,
+    ) -> impl Iterator<Item = (char, usize)> + '_ {
+        self.buffer_snapshot
+            .reversed_chars_at(offset)
             .map(move |ch| {
-                if ch == '\n' {
-                    *point.row_mut() -= 1;
-                    *point.column_mut() = self.line_len(point.row());
-                } else {
-                    *point.column_mut() = point.column().saturating_sub(ch.len_utf8() as u32);
-                }
-                (ch, point)
+                offset -= ch.len_utf8();
+                (ch, offset)
             })
-    }
-
-    pub fn column_to_chars(&self, display_row: u32, target: u32) -> u32 {
-        let mut count = 0;
-        let mut column = 0;
-        for (c, _) in self.chars_at(DisplayPoint::new(display_row, 0)) {
-            if column >= target {
-                break;
-            }
-            count += 1;
-            column += c.len_utf8() as u32;
-        }
-        count
-    }
-
-    pub fn column_from_chars(&self, display_row: u32, char_count: u32) -> u32 {
-        let mut column = 0;
-
-        for (count, (c, _)) in self.chars_at(DisplayPoint::new(display_row, 0)).enumerate() {
-            if c == '\n' || count >= char_count as usize {
-                break;
-            }
-            column += c.len_utf8() as u32;
-        }
-
-        column
     }
 
     pub fn clip_point(&self, point: DisplayPoint, bias: Bias) -> DisplayPoint {
@@ -793,20 +781,6 @@ impl DisplaySnapshot {
         result
     }
 
-    pub fn line_indent(&self, display_row: u32) -> (u32, bool) {
-        let mut indent = 0;
-        let mut is_blank = true;
-        for (c, _) in self.chars_at(DisplayPoint::new(display_row, 0)) {
-            if c == ' ' {
-                indent += 1;
-            } else {
-                is_blank = c == '\n';
-                break;
-            }
-        }
-        (indent, is_blank)
-    }
-
     pub fn line_indent_for_buffer_row(&self, buffer_row: u32) -> (u32, bool) {
         let (buffer, range) = self
             .buffer_snapshot
@@ -837,7 +811,7 @@ impl DisplaySnapshot {
         self.block_snapshot.longest_row()
     }
 
-    pub fn fold_for_line(self: &Self, buffer_row: u32) -> Option<FoldStatus> {
+    pub fn fold_for_line(&self, buffer_row: u32) -> Option<FoldStatus> {
         if self.is_line_folded(buffer_row) {
             Some(FoldStatus::Folded)
         } else if self.is_foldable(buffer_row) {
@@ -847,7 +821,7 @@ impl DisplaySnapshot {
         }
     }
 
-    pub fn is_foldable(self: &Self, buffer_row: u32) -> bool {
+    pub fn is_foldable(&self, buffer_row: u32) -> bool {
         let max_row = self.buffer_snapshot.max_buffer_row();
         if buffer_row >= max_row {
             return false;
@@ -870,7 +844,7 @@ impl DisplaySnapshot {
         false
     }
 
-    pub fn foldable_range(self: &Self, buffer_row: u32) -> Option<Range<Point>> {
+    pub fn foldable_range(&self, buffer_row: u32) -> Option<Range<Point>> {
         let start = Point::new(buffer_row, self.buffer_snapshot.line_len(buffer_row));
         if self.is_foldable(start.row) && !self.is_line_folded(start.row) {
             let (start_indent, _) = self.line_indent_for_buffer_row(buffer_row);
@@ -907,7 +881,7 @@ impl DisplaySnapshot {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn inlay_highlights<Tag: ?Sized + 'static>(
         &self,
-    ) -> Option<&HashMap<InlayId, (HighlightStyle, InlayHighlight)>> {
+    ) -> Option<&TreeMap<InlayId, (HighlightStyle, InlayHighlight)>> {
         let type_id = TypeId::of::<Tag>();
         self.inlay_highlights.get(&type_id)
     }
@@ -1000,17 +974,16 @@ pub mod tests {
         movement,
         test::{editor_test_context::EditorTestContext, marked_display_snapshot},
     };
-    use gpui::{div, font, observe, px, AppContext, Context, Element, Hsla};
+    use gpui::{div, font, observe, px, AppContext, BorrowAppContext, Context, Element, Hsla};
     use language::{
         language_settings::{AllLanguageSettings, AllLanguageSettingsContent},
-        Buffer, Language, LanguageConfig, SelectionGoal,
+        Buffer, Language, LanguageConfig, LanguageMatcher, SelectionGoal,
     };
     use project::Project;
     use rand::{prelude::*, Rng};
     use settings::SettingsStore;
     use smol::stream::StreamExt;
     use std::{env, sync::Arc};
-    use text::BufferId;
     use theme::{LoadThemes, SyntaxTheme};
     use util::test::{marked_text_ranges, sample_text};
     use Bias::*;
@@ -1128,7 +1101,7 @@ pub mod tests {
                                         position,
                                         height,
                                         disposition,
-                                        render: Arc::new(|_| div().into_any()),
+                                        render: Box::new(|_| div().into_any()),
                                     }
                                 })
                                 .collect::<Vec<_>>();
@@ -1281,7 +1254,7 @@ pub mod tests {
 
         let mut cx = EditorTestContext::new(cx).await;
         let editor = cx.editor.clone();
-        let window = cx.window.clone();
+        let window = cx.window;
 
         _ = cx.update_window(window, |_, cx| {
             let text_layout_details =
@@ -1445,15 +1418,16 @@ pub mod tests {
             }"#
         .unindent();
 
-        let theme = SyntaxTheme::new_test(vec![
-            ("mod.body", Hsla::red().into()),
-            ("fn.name", Hsla::blue().into()),
-        ]);
+        let theme =
+            SyntaxTheme::new_test(vec![("mod.body", Hsla::red()), ("fn.name", Hsla::blue())]);
         let language = Arc::new(
             Language::new(
                 LanguageConfig {
                     name: "Test".into(),
-                    path_suffixes: vec![".test".to_string()],
+                    matcher: LanguageMatcher {
+                        path_suffixes: vec![".test".to_string()],
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
                 Some(tree_sitter_rust::language()),
@@ -1470,10 +1444,7 @@ pub mod tests {
 
         cx.update(|cx| init_test(cx, |s| s.defaults.tab_size = Some(2.try_into().unwrap())));
 
-        let buffer = cx.new_model(|cx| {
-            Buffer::new(0, BufferId::new(cx.entity_id().as_u64()).unwrap(), text)
-                .with_language(language, cx)
-        });
+        let buffer = cx.new_model(|cx| Buffer::local(text, cx).with_language(language, cx));
         cx.condition(&buffer, |buf, _| !buf.is_parsing()).await;
         let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
 
@@ -1532,15 +1503,16 @@ pub mod tests {
             }"#
         .unindent();
 
-        let theme = SyntaxTheme::new_test(vec![
-            ("mod.body", Hsla::red().into()),
-            ("fn.name", Hsla::blue().into()),
-        ]);
+        let theme =
+            SyntaxTheme::new_test(vec![("mod.body", Hsla::red()), ("fn.name", Hsla::blue())]);
         let language = Arc::new(
             Language::new(
                 LanguageConfig {
                     name: "Test".into(),
-                    path_suffixes: vec![".test".to_string()],
+                    matcher: LanguageMatcher {
+                        path_suffixes: vec![".test".to_string()],
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
                 Some(tree_sitter_rust::language()),
@@ -1557,10 +1529,7 @@ pub mod tests {
 
         cx.update(|cx| init_test(cx, |_| {}));
 
-        let buffer = cx.new_model(|cx| {
-            Buffer::new(0, BufferId::new(cx.entity_id().as_u64()).unwrap(), text)
-                .with_language(language, cx)
-        });
+        let buffer = cx.new_model(|cx| Buffer::local(text, cx).with_language(language, cx));
         cx.condition(&buffer, |buf, _| !buf.is_parsing()).await;
         let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
 
@@ -1600,15 +1569,16 @@ pub mod tests {
     async fn test_chunks_with_text_highlights(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| init_test(cx, |_| {}));
 
-        let theme = SyntaxTheme::new_test(vec![
-            ("operator", Hsla::red().into()),
-            ("string", Hsla::green().into()),
-        ]);
+        let theme =
+            SyntaxTheme::new_test(vec![("operator", Hsla::red()), ("string", Hsla::green())]);
         let language = Arc::new(
             Language::new(
                 LanguageConfig {
                     name: "Test".into(),
-                    path_suffixes: vec![".test".to_string()],
+                    matcher: LanguageMatcher {
+                        path_suffixes: vec![".test".to_string()],
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
                 Some(tree_sitter_rust::language()),
@@ -1625,10 +1595,7 @@ pub mod tests {
 
         let (text, highlighted_ranges) = marked_text_ranges(r#"constˇ «a»: B = "c «d»""#, false);
 
-        let buffer = cx.new_model(|cx| {
-            Buffer::new(0, BufferId::new(cx.entity_id().as_u64()).unwrap(), text)
-                .with_language(language, cx)
-        });
+        let buffer = cx.new_model(|cx| Buffer::local(text, cx).with_language(language, cx));
         cx.condition(&buffer, |buf, _| !buf.is_parsing()).await;
 
         let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
@@ -1813,10 +1780,10 @@ pub mod tests {
         )
     }
 
-    fn syntax_chunks<'a>(
+    fn syntax_chunks(
         rows: Range<u32>,
         map: &Model<DisplayMap>,
-        theme: &'a SyntaxTheme,
+        theme: &SyntaxTheme,
         cx: &mut AppContext,
     ) -> Vec<(String, Option<Hsla>)> {
         chunks(rows, map, theme, cx)
@@ -1825,15 +1792,15 @@ pub mod tests {
             .collect()
     }
 
-    fn chunks<'a>(
+    fn chunks(
         rows: Range<u32>,
         map: &Model<DisplayMap>,
-        theme: &'a SyntaxTheme,
+        theme: &SyntaxTheme,
         cx: &mut AppContext,
     ) -> Vec<(String, Option<Hsla>, Option<Hsla>)> {
         let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
         let mut chunks: Vec<(String, Option<Hsla>, Option<Hsla>)> = Vec::new();
-        for chunk in snapshot.chunks(rows, true, None, None) {
+        for chunk in snapshot.chunks(rows, true, HighlightStyles::default()) {
             let syntax_color = chunk
                 .syntax_highlight_id
                 .and_then(|id| id.style(theme)?.color);

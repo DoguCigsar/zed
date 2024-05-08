@@ -2,29 +2,38 @@
 //! an origin at the bottom left of the main display.
 mod dispatcher;
 mod display;
-mod display_linker;
+mod display_link;
 mod events;
+
+#[cfg(not(feature = "macos-blade"))]
 mod metal_atlas;
-mod metal_renderer;
+#[cfg(not(feature = "macos-blade"))]
+pub mod metal_renderer;
+
+#[cfg(not(feature = "macos-blade"))]
+use metal_renderer as renderer;
+
+#[cfg(feature = "macos-blade")]
+use crate::platform::blade as renderer;
+
 mod open_type;
 mod platform;
 mod text_system;
 mod window;
 mod window_appearance;
 
-use crate::{px, size, GlobalPixels, Pixels, Size};
+use crate::{px, size, DevicePixels, Pixels, Size};
 use cocoa::{
     base::{id, nil},
     foundation::{NSAutoreleasePool, NSNotFound, NSRect, NSSize, NSString, NSUInteger},
 };
-use metal_renderer::*;
+
 use objc::runtime::{BOOL, NO, YES};
 use std::ops::Range;
 
 pub(crate) use dispatcher::*;
 pub(crate) use display::*;
-pub(crate) use display_linker::*;
-pub(crate) use metal_atlas::*;
+pub(crate) use display_link::*;
 pub(crate) use platform::*;
 pub(crate) use text_system::*;
 pub(crate) use window::*;
@@ -113,9 +122,9 @@ impl From<NSRect> for Size<Pixels> {
     }
 }
 
-impl From<NSRect> for Size<GlobalPixels> {
+impl From<NSRect> for Size<DevicePixels> {
     fn from(rect: NSRect) -> Self {
         let NSSize { width, height } = rect.size;
-        size(width.into(), height.into())
+        size(DevicePixels(width as i32), DevicePixels(height as i32))
     }
 }

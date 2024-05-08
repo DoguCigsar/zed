@@ -17,7 +17,8 @@ use regex::Regex;
 use serde_derive::Serialize;
 use ui::{prelude::*, Button, ButtonStyle, IconPosition, Tooltip};
 use util::{http::HttpClient, ResultExt};
-use workspace::{ModalView, Toast, Workspace};
+use workspace::notifications::NotificationId;
+use workspace::{DismissDecision, ModalView, Toast, Workspace};
 
 use crate::{system_specs::SystemSpecs, GiveFeedback, OpenZedRepo};
 
@@ -85,16 +86,16 @@ impl FocusableView for FeedbackModal {
 impl EventEmitter<DismissEvent> for FeedbackModal {}
 
 impl ModalView for FeedbackModal {
-    fn on_before_dismiss(&mut self, cx: &mut ViewContext<Self>) -> bool {
+    fn on_before_dismiss(&mut self, cx: &mut ViewContext<Self>) -> DismissDecision {
         self.update_email_in_store(cx);
 
         if self.dismiss_modal {
-            return true;
+            return DismissDecision::Dismiss(true);
         }
 
         let has_feedback = self.feedback_editor.read(cx).text_option(cx).is_some();
         if !has_feedback {
-            return true;
+            return DismissDecision::Dismiss(true);
         }
 
         let answer = cx.prompt(PromptLevel::Info, "Discard feedback?", None, &["Yes", "No"]);
@@ -110,7 +111,7 @@ impl ModalView for FeedbackModal {
         })
         .detach();
 
-        false
+        DismissDecision::Pending
     }
 }
 
@@ -127,11 +128,11 @@ impl FeedbackModal {
             let is_local_project = project.read(cx).is_local();
 
             if !is_local_project {
-                const TOAST_ID: usize = 0xdeadbeef;
+                struct FeedbackInRemoteProject;
 
                 workspace.show_toast(
                     Toast::new(
-                        TOAST_ID,
+                        NotificationId::unique::<FeedbackInRemoteProject>(),
                         "You can only submit feedback in your own project.",
                     ),
                     cx,
@@ -141,11 +142,9 @@ impl FeedbackModal {
 
             cx.spawn(|workspace, mut cx| async move {
                 let markdown = markdown.await.log_err();
-                let buffer = project
-                    .update(&mut cx, |project, cx| {
-                        project.create_buffer("", markdown, cx)
-                    })?
-                    .expect("creating buffers on a local workspace always succeeds");
+                let buffer = project.update(&mut cx, |project, cx| {
+                    project.create_local_buffer("", markdown, cx)
+                })?;
 
                 workspace.update(&mut cx, |workspace, cx| {
                     let system_specs = SystemSpecs::new(cx);
@@ -185,8 +184,9 @@ impl FeedbackModal {
                 cx,
             );
             editor.set_show_gutter(false, cx);
-            editor.set_show_copilot_suggestions(false);
+            editor.set_show_inline_completions(false);
             editor.set_vertical_scroll_margin(5, cx);
+            editor.set_use_modal_editing(false);
             editor
         });
 
@@ -298,7 +298,7 @@ impl FeedbackModal {
         let installation_id = telemetry.installation_id();
         let is_staff = telemetry.is_staff();
         let http_client = zed_client.http_client();
-        let feedback_endpoint = http_client.zed_url("/api/feedback");
+        let feedback_endpoint = http_client.build_url("/api/feedback");
         let request = FeedbackRequestBody {
             feedback_text: &feedback_text,
             email,
@@ -430,7 +430,7 @@ impl Render for FeedbackModal {
             .h(rems(32.))
             .p_4()
             .gap_2()
-            .child(Headline::new("Share Feedback"))
+            .child(Headline::new("Give Feedback"))
             .child(
                 Label::new(if self.character_count < *FEEDBACK_CHAR_LIMIT.start() {
                     format!(
@@ -454,7 +454,7 @@ impl Render for FeedbackModal {
                     .flex_1()
                     .bg(cx.theme().colors().editor_background)
                     .p_2()
-                    .border()
+                    .border_1()
                     .rounded_md()
                     .border_color(cx.theme().colors().border)
                     .child(self.feedback_editor.clone()),
@@ -466,7 +466,7 @@ impl Render for FeedbackModal {
                         h_flex()
                             .bg(cx.theme().colors().editor_background)
                             .p_2()
-                            .border()
+                            .border_1()
                             .rounded_md()
                             .border_color(if self.valid_email_address() {
                                 cx.theme().colors().border

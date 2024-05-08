@@ -5,10 +5,13 @@ edition = "2021"
 publish = false
 license = "GPL-3.0-or-later"
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/fuzzy.rs"
 doctest = false
 
 [dependencies]
-gpui = { path = "../gpui" }
-util = { path = "../util" }
+gpui.workspace = true
+util.workspace = true

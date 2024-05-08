@@ -5,7 +5,7 @@ use futures::StreamExt;
 use gpui::{prelude::*, AppContext, WindowHandle};
 use settings::Settings;
 use std::sync::{Arc, Weak};
-use theme::{SystemAppearance, ThemeSettings};
+use theme::ThemeSettings;
 use ui::{prelude::*, Button, Label};
 use util::ResultExt;
 use workspace::AppState;
@@ -32,30 +32,27 @@ pub fn init(app_state: &Arc<AppState>, cx: &mut AppContext) {
                 };
 
                 for screen in unique_screens {
-                    let options = notification_window_options(screen, window_size);
-                    let window = cx
-                        .open_window(options, |cx| {
-                            SystemAppearance::init_for_window(cx);
-
-                            cx.new_view(|_| {
-                                IncomingCallNotification::new(
-                                    incoming_call.clone(),
-                                    app_state.clone(),
-                                )
+                    if let Some(options) = cx
+                        .update(|cx| notification_window_options(screen, window_size, cx))
+                        .log_err()
+                    {
+                        let window = cx
+                            .open_window(options, |cx| {
+                                cx.new_view(|_| {
+                                    IncomingCallNotification::new(
+                                        incoming_call.clone(),
+                                        app_state.clone(),
+                                    )
+                                })
                             })
-                        })
-                        .unwrap();
-                    notification_windows.push(window);
+                            .unwrap();
+                        notification_windows.push(window);
+                    }
                 }
             }
         }
     })
     .detach();
-}
-
-#[derive(Clone, PartialEq)]
-struct RespondToCall {
-    accept: bool,
 }
 
 struct IncomingCallNotificationState {
@@ -84,7 +81,7 @@ impl IncomingCallNotificationState {
                 if let Some(project_id) = initial_project_id {
                     cx.update(|cx| {
                         if let Some(app_state) = app_state.upgrade() {
-                            workspace::join_remote_project(
+                            workspace::join_in_room_project(
                                 project_id,
                                 caller_user_id,
                                 app_state,
@@ -121,13 +118,13 @@ impl Render for IncomingCallNotification {
             let theme_settings = ThemeSettings::get_global(cx);
             (
                 theme_settings.ui_font.family.clone(),
-                theme_settings.ui_font_size.clone(),
+                theme_settings.ui_font_size,
             )
         };
 
         cx.set_rem_size(ui_font_size);
 
-        div().size_full().font(ui_font).child(
+        div().size_full().font_family(ui_font).child(
             CollabNotification::new(
                 self.state.call.calling_user.avatar_uri.clone(),
                 Button::new("accept", "Accept").on_click({

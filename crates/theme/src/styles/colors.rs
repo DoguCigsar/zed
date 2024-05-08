@@ -1,4 +1,4 @@
-use gpui::Hsla;
+use gpui::{Hsla, WindowBackgroundAppearance};
 use refineable::Refineable;
 use std::sync::Arc;
 
@@ -119,6 +119,7 @@ pub struct ThemeColors {
     pub panel_background: Hsla,
     pub panel_focused_border: Hsla,
     pub pane_focused_border: Hsla,
+    pub pane_group_border: Hsla,
     /// The color of the scrollbar thumb.
     pub scrollbar_thumb_background: Hsla,
     /// The color of the scrollbar thumb when hovered over.
@@ -130,7 +131,7 @@ pub struct ThemeColors {
     /// The border color of the scrollbar track.
     pub scrollbar_track_border: Hsla,
     // /// The opacity of the scrollbar status marks, like diagnostic states and git status.
-    // todo!()
+    // todo()
     // pub scrollbar_status_opacity: Hsla,
 
     // ===
@@ -235,6 +236,8 @@ pub struct ThemeColors {
 
 #[derive(Refineable, Clone)]
 pub struct ThemeStyles {
+    /// The background appearance of the window.
+    pub window_background_appearance: WindowBackgroundAppearance,
     pub system: SystemColors,
     /// An array of colors used for theme elements that iterate through a series of colors.
     ///

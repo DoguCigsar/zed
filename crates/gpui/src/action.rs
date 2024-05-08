@@ -39,7 +39,7 @@ use std::any::{Any, TypeId};
 /// }
 /// register_action!(Paste);
 /// ```
-pub trait Action: 'static {
+pub trait Action: 'static + Send {
     /// Clone the action into a new box
     fn boxed_clone(&self) -> Box<dyn Action>;
 
@@ -182,7 +182,9 @@ impl ActionRegistry {
 macro_rules! actions {
     ($namespace:path, [ $($name:ident),* $(,)? ]) => {
         $(
-            /// The `$name` action see [`gpui::actions!`]
+            #[doc = "The `"]
+            #[doc = stringify!($name)]
+            #[doc = "` action, see [`gpui::actions!`]"]
             #[derive(::std::cmp::PartialEq, ::std::clone::Clone, ::std::default::Default, ::std::fmt::Debug, gpui::private::serde_derive::Deserialize)]
             #[serde(crate = "gpui::private::serde")]
             pub struct $name;

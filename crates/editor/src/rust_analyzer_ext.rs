@@ -62,7 +62,6 @@ pub fn expand_macro_recursively(
             project
                 .read(cx)
                 .language_servers_for_buffer(buffer.read(cx), cx)
-                .into_iter()
                 .find_map(|(adapter, server)| {
                     if adapter.name.0.as_ref() == "rust-analyzer" {
                         Some((
@@ -98,15 +97,20 @@ pub fn expand_macro_recursively(
             return Ok(());
         }
 
-        let buffer = project.update(&mut cx, |project, cx| {
-            project.create_buffer(&macro_expansion.expansion, Some(rust_language), cx)
-        })??;
+        let buffer = project
+            .update(&mut cx, |project, cx| project.create_buffer(cx))?
+            .await?;
         workspace.update(&mut cx, |workspace, cx| {
-            let buffer = cx.new_model(|cx| {
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit([(0..0, macro_expansion.expansion)], None, cx);
+                buffer.set_language(Some(rust_language), cx)
+            });
+            let multibuffer = cx.new_model(|cx| {
                 MultiBuffer::singleton(buffer, cx).with_title(macro_expansion.name)
             });
-            workspace.add_item(
-                Box::new(cx.new_view(|cx| Editor::for_multibuffer(buffer, Some(project), cx))),
+            workspace.add_item_to_active_pane(
+                Box::new(cx.new_view(|cx| Editor::for_multibuffer(multibuffer, Some(project), cx))),
+                None,
                 cx,
             );
         })

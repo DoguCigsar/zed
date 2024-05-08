@@ -37,10 +37,10 @@ impl StoryColor {
             primary: hsla(216. / 360., 11. / 100., 0. / 100., 1.),
             secondary: hsla(216. / 360., 11. / 100., 16. / 100., 1.),
             border: hsla(216. / 360., 11. / 100., 91. / 100., 1.),
-            background: hsla(0. / 360., 0. / 100., 100. / 100., 1.),
+            background: hsla(0. / 360., 0. / 100., 1., 1.),
             card_background: hsla(0. / 360., 0. / 100., 96. / 100., 1.),
             divider: hsla(216. / 360., 11. / 100., 86. / 100., 1.),
-            link: hsla(206. / 360., 100. / 100., 50. / 100., 1.),
+            link: hsla(206. / 360., 1., 50. / 100., 1.),
         }
     }
 }
@@ -88,7 +88,7 @@ impl RenderOnce for StoryContainer {
                     .justify_between()
                     .p_2()
                     .bg(story_color().background)
-                    .border_b()
+                    .border_b_1()
                     .border_color(story_color().border)
                     .child(Story::title(self.title))
                     .child(
@@ -145,7 +145,7 @@ impl Story {
                         .flex()
                         .justify_between()
                         .p_2()
-                        .border_b()
+                        .border_b_1()
                         .border_color(story_color().border)
                         .child(Story::title_for::<T>())
                         .child(
@@ -202,7 +202,7 @@ impl Story {
         div()
             .p_4()
             .m_4()
-            .border()
+            .border_1()
             .border_color(story_color().border)
     }
 
@@ -307,7 +307,7 @@ impl RenderOnce for StoryItem {
                         div()
                             .rounded_md()
                             .bg(story_color().card_background)
-                            .border()
+                            .border_1()
                             .border_color(story_color().border)
                             .py_1()
                             .px_2()

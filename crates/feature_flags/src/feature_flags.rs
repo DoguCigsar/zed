@@ -8,7 +8,7 @@ struct FeatureFlags {
 
 impl FeatureFlags {
     fn has_flag(&self, flag: &str) -> bool {
-        self.staff || self.flags.iter().find(|f| f.as_str() == flag).is_some()
+        self.staff || self.flags.iter().any(|f| f.as_str() == flag)
     }
 }
 
@@ -16,6 +16,11 @@ impl Global for FeatureFlags {}
 
 pub trait FeatureFlag {
     const NAME: &'static str;
+}
+
+pub struct Remoting {}
+impl FeatureFlag for Remoting {
+    const NAME: &'static str = "remoting";
 }
 
 pub trait FeatureFlagViewExt<V: 'static> {

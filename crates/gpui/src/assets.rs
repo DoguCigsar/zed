@@ -20,7 +20,7 @@ pub trait AssetSource: 'static + Send + Sync {
 impl AssetSource for () {
     fn load(&self, path: &str) -> Result<Cow<'static, [u8]>> {
         Err(anyhow!(
-            "get called on empty asset provider with \"{}\"",
+            "load called on empty asset provider with \"{}\"",
             path
         ))
     }
@@ -33,6 +33,11 @@ impl AssetSource for () {
 /// A unique identifier for the image cache
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ImageId(usize);
+
+#[derive(PartialEq, Eq, Hash, Clone)]
+pub(crate) struct RenderImageParams {
+    pub(crate) image_id: ImageId,
+}
 
 /// A cached and processed image.
 pub struct ImageData {

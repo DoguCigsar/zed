@@ -3,10 +3,9 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use collections::{BTreeMap, HashMap, HashSet};
 use futures::Stream;
-use gpui::BackgroundExecutor;
+use gpui::{BackgroundExecutor, ImageSource};
 use live_kit_server::{proto, token};
-#[cfg(target_os = "macos")]
-use media::core_video::CVImageBuffer;
+
 use parking_lot::Mutex;
 use postage::watch;
 use std::{
@@ -74,6 +73,8 @@ impl TestServer {
     }
 
     pub async fn create_room(&self, room: String) -> Result<()> {
+        // todo(linux): Remove this once the cross-platform LiveKit implementation is merged
+        #[cfg(any(test, feature = "test-support"))]
         self.executor.simulate_random_delay().await;
         let mut server_rooms = self.rooms.lock();
         if server_rooms.contains_key(&room) {
@@ -86,6 +87,8 @@ impl TestServer {
 
     async fn delete_room(&self, room: String) -> Result<()> {
         // TODO: clear state associated with all `Room`s.
+        // todo(linux): Remove this once the cross-platform LiveKit implementation is merged
+        #[cfg(any(test, feature = "test-support"))]
         self.executor.simulate_random_delay().await;
         let mut server_rooms = self.rooms.lock();
         server_rooms
@@ -95,7 +98,10 @@ impl TestServer {
     }
 
     async fn join_room(&self, token: String, client_room: Arc<Room>) -> Result<()> {
+        // todo(linux): Remove this once the cross-platform LiveKit implementation is merged
+        #[cfg(any(test, feature = "test-support"))]
         self.executor.simulate_random_delay().await;
+
         let claims = live_kit_server::token::validate(&token, &self.secret_key)?;
         let identity = claims.sub.unwrap().to_string();
         let room_name = claims.video.room.unwrap();
@@ -141,6 +147,8 @@ impl TestServer {
     }
 
     async fn leave_room(&self, token: String) -> Result<()> {
+        // todo(linux): Remove this once the cross-platform LiveKit implementation is merged
+        #[cfg(any(test, feature = "test-support"))]
         self.executor.simulate_random_delay().await;
         let claims = live_kit_server::token::validate(&token, &self.secret_key)?;
         let identity = claims.sub.unwrap().to_string();
@@ -161,8 +169,10 @@ impl TestServer {
 
     async fn remove_participant(&self, room_name: String, identity: String) -> Result<()> {
         // TODO: clear state associated with the `Room`.
-
+        // todo(linux): Remove this once the cross-platform LiveKit implementation is merged
+        #[cfg(any(test, feature = "test-support"))]
         self.executor.simulate_random_delay().await;
+
         let mut server_rooms = self.rooms.lock();
         let room = server_rooms
             .get_mut(&room_name)
@@ -183,6 +193,8 @@ impl TestServer {
         identity: String,
         permission: proto::ParticipantPermission,
     ) -> Result<()> {
+        // todo(linux): Remove this once the cross-platform LiveKit implementation is merged
+        #[cfg(any(test, feature = "test-support"))]
         self.executor.simulate_random_delay().await;
         let mut server_rooms = self.rooms.lock();
         let room = server_rooms
@@ -193,6 +205,8 @@ impl TestServer {
     }
 
     pub async fn disconnect_client(&self, client_identity: String) {
+        // todo(linux): Remove this once the cross-platform LiveKit implementation is merged
+        #[cfg(any(test, feature = "test-support"))]
         self.executor.simulate_random_delay().await;
         let mut server_rooms = self.rooms.lock();
         for room in server_rooms.values_mut() {
@@ -207,6 +221,8 @@ impl TestServer {
         token: String,
         local_track: LocalVideoTrack,
     ) -> Result<Sid> {
+        // todo(linux): Remove this once the cross-platform LiveKit implementation is merged
+        #[cfg(any(test, feature = "test-support"))]
         self.executor.simulate_random_delay().await;
         let claims = live_kit_server::token::validate(&token, &self.secret_key)?;
         let identity = claims.sub.unwrap().to_string();
@@ -260,7 +276,10 @@ impl TestServer {
         token: String,
         _local_track: &LocalAudioTrack,
     ) -> Result<Sid> {
+        // todo(linux): Remove this once the cross-platform LiveKit implementation is merged
+        #[cfg(any(test, feature = "test-support"))]
         self.executor.simulate_random_delay().await;
+
         let claims = live_kit_server::token::validate(&token, &self.secret_key)?;
         let identity = claims.sub.unwrap().to_string();
         let room_name = claims.video.room.unwrap();
@@ -540,8 +559,13 @@ impl Room {
     pub fn display_sources(self: &Arc<Self>) -> impl Future<Output = Result<Vec<MacOSDisplay>>> {
         let this = self.clone();
         async move {
-            let server = this.test_server();
-            server.executor.simulate_random_delay().await;
+            // todo(linux): Remove this once the cross-platform LiveKit implementation is merged
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                let server = this.test_server();
+                server.executor.simulate_random_delay().await;
+            }
+
             Ok(this.0.lock().display_sources.clone())
         }
     }
@@ -846,8 +870,7 @@ impl Frame {
         self.height
     }
 
-    #[cfg(target_os = "macos")]
-    pub fn image(&self) -> CVImageBuffer {
+    pub fn image(&self) -> ImageSource {
         unimplemented!("you can't call this in test mode")
     }
 }

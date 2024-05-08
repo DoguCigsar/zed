@@ -1,12 +1,8 @@
-#[cfg(test)]
-pub mod tests;
-
-#[cfg(test)]
-pub use tests::TestDb;
-
 mod ids;
 mod queries;
 mod tables;
+#[cfg(test)]
+pub mod tests;
 
 use crate::{executor::Executor, Error, Result};
 use anyhow::anyhow;
@@ -16,7 +12,7 @@ use futures::StreamExt;
 use rand::{prelude::StdRng, Rng, SeedableRng};
 use rpc::{
     proto::{self},
-    ConnectionId,
+    ConnectionId, ExtensionMetadata,
 };
 use sea_orm::{
     entity::prelude::*,
@@ -25,11 +21,13 @@ use sea_orm::{
     FromQueryResult, IntoActiveModel, IsolationLevel, JoinType, QueryOrder, QuerySelect, Statement,
     TransactionTrait,
 };
+use semantic_version::SemanticVersion;
 use serde::{Deserialize, Serialize};
 use sqlx::{
     migrate::{Migrate, Migration, MigrationSource},
     Connection,
 };
+use std::ops::RangeInclusive;
 use std::{
     fmt::Write as _,
     future::Future,
@@ -40,13 +38,17 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-pub use tables::*;
+use time::PrimitiveDateTime;
 use tokio::sync::{Mutex, OwnedMutexGuard};
+
+#[cfg(test)]
+pub use tests::TestDb;
 
 pub use ids::*;
 pub use queries::contributors::ContributorSelector;
 pub use sea_orm::ConnectOptions;
 pub use tables::user::Model as User;
+pub use tables::*;
 
 /// Database gives you a handle that lets you access the database.
 /// It handles pooling internally.
@@ -54,6 +56,7 @@ pub struct Database {
     options: ConnectOptions,
     pool: DatabaseConnection,
     rooms: DashMap<RoomId, Arc<Mutex<()>>>,
+    projects: DashMap<ProjectId, Arc<Mutex<()>>>,
     rng: Mutex<StdRng>,
     executor: Executor,
     notification_kinds_by_id: HashMap<NotificationKindId, &'static str>,
@@ -72,6 +75,7 @@ impl Database {
             options: options.clone(),
             pool: sea_orm::Database::connect(options).await?,
             rooms: DashMap::with_capacity(16384),
+            projects: DashMap::with_capacity(16384),
             rng: Mutex::new(StdRng::seed_from_u64(0)),
             notification_kinds_by_id: HashMap::default(),
             notification_kinds_by_name: HashMap::default(),
@@ -84,6 +88,7 @@ impl Database {
     #[cfg(test)]
     pub fn reset(&self) {
         self.rooms.clear();
+        self.projects.clear();
     }
 
     /// Runs the database migrations.
@@ -126,12 +131,6 @@ impl Database {
         }
 
         Ok(new_migrations)
-    }
-
-    /// Initializes static data that resides in the database by upserting it.
-    pub async fn initialize_static_data(&mut self) -> Result<()> {
-        self.initialize_notification_kinds().await?;
-        Ok(())
     }
 
     /// Transaction runs things in a transaction. If you want to call other methods
@@ -194,7 +193,10 @@ impl Database {
     }
 
     /// The same as room_transaction, but if you need to only optionally return a Room.
-    async fn optional_room_transaction<F, Fut, T>(&self, f: F) -> Result<Option<RoomGuard<T>>>
+    async fn optional_room_transaction<F, Fut, T>(
+        &self,
+        f: F,
+    ) -> Result<Option<TransactionGuard<T>>>
     where
         F: Send + Fn(TransactionHandle) -> Fut,
         Fut: Send + Future<Output = Result<Option<(RoomId, T)>>>,
@@ -209,7 +211,7 @@ impl Database {
                         let _guard = lock.lock_owned().await;
                         match tx.commit().await.map_err(Into::into) {
                             Ok(()) => {
-                                return Ok(Some(RoomGuard {
+                                return Ok(Some(TransactionGuard {
                                     data,
                                     _guard,
                                     _not_send: PhantomData,
@@ -244,10 +246,63 @@ impl Database {
         self.run(body).await
     }
 
+    async fn project_transaction<F, Fut, T>(
+        &self,
+        project_id: ProjectId,
+        f: F,
+    ) -> Result<TransactionGuard<T>>
+    where
+        F: Send + Fn(TransactionHandle) -> Fut,
+        Fut: Send + Future<Output = Result<T>>,
+    {
+        let room_id = Database::room_id_for_project(&self, project_id).await?;
+        let body = async {
+            let mut i = 0;
+            loop {
+                let lock = if let Some(room_id) = room_id {
+                    self.rooms.entry(room_id).or_default().clone()
+                } else {
+                    self.projects.entry(project_id).or_default().clone()
+                };
+                let _guard = lock.lock_owned().await;
+                let (tx, result) = self.with_transaction(&f).await?;
+                match result {
+                    Ok(data) => match tx.commit().await.map_err(Into::into) {
+                        Ok(()) => {
+                            return Ok(TransactionGuard {
+                                data,
+                                _guard,
+                                _not_send: PhantomData,
+                            });
+                        }
+                        Err(error) => {
+                            if !self.retry_on_serialization_error(&error, i).await {
+                                return Err(error);
+                            }
+                        }
+                    },
+                    Err(error) => {
+                        tx.rollback().await?;
+                        if !self.retry_on_serialization_error(&error, i).await {
+                            return Err(error);
+                        }
+                    }
+                }
+                i += 1;
+            }
+        };
+
+        self.run(body).await
+    }
+
     /// room_transaction runs the block in a transaction. It returns a RoomGuard, that keeps
     /// the database locked until it is dropped. This ensures that updates sent to clients are
     /// properly serialized with respect to database changes.
-    async fn room_transaction<F, Fut, T>(&self, room_id: RoomId, f: F) -> Result<RoomGuard<T>>
+    async fn room_transaction<F, Fut, T>(
+        &self,
+        room_id: RoomId,
+        f: F,
+    ) -> Result<TransactionGuard<T>>
     where
         F: Send + Fn(TransactionHandle) -> Fut,
         Fut: Send + Future<Output = Result<T>>,
@@ -261,7 +316,7 @@ impl Database {
                 match result {
                     Ok(data) => match tx.commit().await.map_err(Into::into) {
                         Ok(()) => {
-                            return Ok(RoomGuard {
+                            return Ok(TransactionGuard {
                                 data,
                                 _guard,
                                 _not_send: PhantomData,
@@ -359,7 +414,7 @@ impl Database {
         const SLEEPS: [f32; 10] = [10., 20., 40., 80., 160., 320., 640., 1280., 2560., 5120.];
         if is_serialization_error(error) && prev_attempt_count < SLEEPS.len() {
             let base_delay = SLEEPS[prev_attempt_count];
-            let randomized_delay = base_delay as f32 * self.rng.lock().await.gen_range(0.5..=2.0);
+            let randomized_delay = base_delay * self.rng.lock().await.gen_range(0.5..=2.0);
             log::info!(
                 "retrying transaction after serialization error. delay: {} ms.",
                 randomized_delay
@@ -375,7 +430,7 @@ impl Database {
 }
 
 fn is_serialization_error(error: &Error) -> bool {
-    const SERIALIZATION_FAILURE_CODE: &'static str = "40001";
+    const SERIALIZATION_FAILURE_CODE: &str = "40001";
     match error {
         Error::Database(
             DbErr::Exec(sea_orm::RuntimeErr::SqlxError(error))
@@ -403,15 +458,16 @@ impl Deref for TransactionHandle {
     }
 }
 
-/// [`RoomGuard`] keeps a database transaction alive until it is dropped.
-/// so that updates to rooms are serialized.
-pub struct RoomGuard<T> {
+/// [`TransactionGuard`] keeps a database transaction alive until it is dropped.
+/// It wraps data that depends on the state of the database and prevents an additional
+/// transaction from starting that would invalidate that data.
+pub struct TransactionGuard<T> {
     data: T,
     _guard: OwnedMutexGuard<()>,
     _not_send: PhantomData<Rc<()>>,
 }
 
-impl<T> Deref for RoomGuard<T> {
+impl<T> Deref for TransactionGuard<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -419,13 +475,13 @@ impl<T> Deref for RoomGuard<T> {
     }
 }
 
-impl<T> DerefMut for RoomGuard<T> {
+impl<T> DerefMut for TransactionGuard<T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.data
     }
 }
 
-impl<T> RoomGuard<T> {
+impl<T> TransactionGuard<T> {
     /// Returns the inner value of the guard.
     pub fn into_inner(self) -> T {
         self.data
@@ -456,6 +512,16 @@ pub struct CreatedChannelMessage {
     pub participant_connection_ids: Vec<ConnectionId>,
     pub channel_members: Vec<UserId>,
     pub notifications: NotificationBatch,
+}
+
+pub struct UpdatedChannelMessage {
+    pub message_id: MessageId,
+    pub participant_connection_ids: Vec<ConnectionId>,
+    pub notifications: NotificationBatch,
+    pub reply_to_message_id: Option<MessageId>,
+    pub timestamp: PrimitiveDateTime,
+    pub deleted_mention_notification_ids: Vec<NotificationId>,
+    pub updated_mention_notifications: Vec<rpc::proto::Notification>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, FromQueryResult, Serialize, Deserialize)]
@@ -512,6 +578,7 @@ pub struct MembershipUpdated {
 
 /// The result of setting a member's role.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum SetMemberRoleResult {
     InviteUpdated(Channel),
     MembershipUpdated(MembershipUpdated),
@@ -546,7 +613,7 @@ pub struct Channel {
 }
 
 impl Channel {
-    fn from_model(value: channel::Model) -> Self {
+    pub fn from_model(value: channel::Model) -> Self {
         Channel {
             id: value.id,
             visibility: value.visibility,
@@ -587,6 +654,10 @@ pub struct ChannelsForUser {
     pub channels: Vec<Channel>,
     pub channel_memberships: Vec<channel_member::Model>,
     pub channel_participants: HashMap<ChannelId, Vec<UserId>>,
+    pub hosted_projects: Vec<proto::HostedProject>,
+
+    pub observed_buffer_versions: Vec<proto::ChannelBufferVersion>,
+    pub observed_channel_messages: Vec<proto::ChannelMessageId>,
     pub latest_buffer_versions: Vec<proto::ChannelBufferVersion>,
     pub latest_channel_messages: Vec<proto::ChannelMessageId>,
 }
@@ -600,16 +671,14 @@ pub struct RejoinedChannelBuffer {
 #[derive(Clone)]
 pub struct JoinRoom {
     pub room: proto::Room,
-    pub channel_id: Option<ChannelId>,
-    pub channel_members: Vec<UserId>,
+    pub channel: Option<channel::Model>,
 }
 
 pub struct RejoinedRoom {
     pub room: proto::Room,
     pub rejoined_projects: Vec<RejoinedProject>,
     pub reshared_projects: Vec<ResharedProject>,
-    pub channel_id: Option<ChannelId>,
-    pub channel_members: Vec<UserId>,
+    pub channel: Option<channel::Model>,
 }
 
 pub struct ResharedProject {
@@ -625,6 +694,30 @@ pub struct RejoinedProject {
     pub collaborators: Vec<ProjectCollaborator>,
     pub worktrees: Vec<RejoinedWorktree>,
     pub language_servers: Vec<proto::LanguageServer>,
+}
+
+impl RejoinedProject {
+    pub fn to_proto(&self) -> proto::RejoinedProject {
+        proto::RejoinedProject {
+            id: self.id.to_proto(),
+            worktrees: self
+                .worktrees
+                .iter()
+                .map(|worktree| proto::WorktreeMetadata {
+                    id: worktree.id,
+                    root_name: worktree.root_name.clone(),
+                    visible: worktree.visible,
+                    abs_path: worktree.abs_path.clone(),
+                })
+                .collect(),
+            collaborators: self
+                .collaborators
+                .iter()
+                .map(|collaborator| collaborator.to_proto())
+                .collect(),
+            language_servers: self.language_servers.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -645,8 +738,7 @@ pub struct RejoinedWorktree {
 
 pub struct LeftRoom {
     pub room: proto::Room,
-    pub channel_id: Option<ChannelId>,
-    pub channel_members: Vec<UserId>,
+    pub channel: Option<channel::Model>,
     pub left_projects: HashMap<ProjectId, LeftProject>,
     pub canceled_calls_to_user_ids: Vec<UserId>,
     pub deleted: bool,
@@ -654,8 +746,7 @@ pub struct LeftRoom {
 
 pub struct RefreshedRoom {
     pub room: proto::Room,
-    pub channel_id: Option<ChannelId>,
-    pub channel_members: Vec<UserId>,
+    pub channel: Option<channel::Model>,
     pub stale_participant_user_ids: Vec<UserId>,
     pub canceled_calls_to_user_ids: Vec<UserId>,
 }
@@ -666,9 +757,12 @@ pub struct RefreshedChannelBuffer {
 }
 
 pub struct Project {
+    pub id: ProjectId,
+    pub role: ChannelRole,
     pub collaborators: Vec<ProjectCollaborator>,
     pub worktrees: BTreeMap<u64, Worktree>,
     pub language_servers: Vec<proto::LanguageServer>,
+    pub dev_server_project_id: Option<DevServerProjectId>,
 }
 
 pub struct ProjectCollaborator {
@@ -691,8 +785,7 @@ impl ProjectCollaborator {
 #[derive(Debug)]
 pub struct LeftProject {
     pub id: ProjectId,
-    pub host_user_id: UserId,
-    pub host_connection_id: ConnectionId,
+    pub should_unshare: bool,
     pub connection_ids: Vec<ConnectionId>,
 }
 
@@ -713,4 +806,20 @@ pub struct Worktree {
 pub struct WorktreeSettingsFile {
     pub path: String,
     pub content: String,
+}
+
+pub struct NewExtensionVersion {
+    pub name: String,
+    pub version: semver::Version,
+    pub description: String,
+    pub authors: Vec<String>,
+    pub repository: String,
+    pub schema_version: i32,
+    pub wasm_api_version: Option<String>,
+    pub published_at: PrimitiveDateTime,
+}
+
+pub struct ExtensionVersionConstraints {
+    pub schema_versions: RangeInclusive<i32>,
+    pub wasm_api_versions: RangeInclusive<SemanticVersion>,
 }

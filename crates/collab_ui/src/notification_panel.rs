@@ -1,7 +1,7 @@
 use crate::{chat_panel::ChatPanel, NotificationPanelSettings};
 use anyhow::Result;
 use channel::ChannelStore;
-use client::{Client, Notification, User, UserStore};
+use client::{ChannelId, Client, Notification, User, UserStore};
 use collections::HashMap;
 use db::kvp::KEY_VALUE_STORE;
 use futures::StreamExt;
@@ -19,8 +19,9 @@ use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
 use std::{sync::Arc, time::Duration};
 use time::{OffsetDateTime, UtcOffset};
-use ui::{h_flex, prelude::*, v_flex, Avatar, Button, Icon, IconButton, IconName, Label};
+use ui::{h_flex, prelude::*, v_flex, Avatar, Button, Icon, IconButton, IconName, Label, Tooltip};
 use util::{ResultExt, TryFutureExt};
+use workspace::notifications::NotificationId;
 use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
     Workspace,
@@ -29,7 +30,7 @@ use workspace::{
 const LOADING_THRESHOLD: usize = 30;
 const MARK_AS_READ_DELAY: Duration = Duration::from_secs(1);
 const TOAST_DURATION: Duration = Duration::from_secs(5);
-const NOTIFICATION_PANEL_KEY: &'static str = "NotificationPanel";
+const NOTIFICATION_PANEL_KEY: &str = "NotificationPanel";
 
 pub struct NotificationPanel {
     client: Arc<Client>,
@@ -183,7 +184,7 @@ impl NotificationPanel {
                 let panel = Self::new(workspace, cx);
                 if let Some(serialized_panel) = serialized_panel {
                     panel.update(cx, |panel, cx| {
-                        panel.width = serialized_panel.width;
+                        panel.width = serialized_panel.width.map(|w| w.round());
                         cx.notify();
                     });
                 }
@@ -228,6 +229,20 @@ impl NotificationPanel {
             self.did_render_notification(notification_id, &notification, cx);
         }
 
+        let relative_timestamp = time_format::format_localized_timestamp(
+            timestamp,
+            now,
+            self.local_timezone,
+            time_format::TimestampFormat::Relative,
+        );
+
+        let absolute_timestamp = time_format::format_localized_timestamp(
+            timestamp,
+            now,
+            self.local_timezone,
+            time_format::TimestampFormat::Absolute,
+        );
+
         Some(
             div()
                 .id(ix)
@@ -237,6 +252,7 @@ impl NotificationPanel {
                 .px_2()
                 .py_1()
                 .gap_2()
+                .hover(|style| style.bg(cx.theme().colors().element_hover))
                 .when(can_navigate, |el| {
                     el.cursor(CursorStyle::PointingHand).on_click({
                         let notification = notification.clone();
@@ -261,12 +277,17 @@ impl NotificationPanel {
                         .child(
                             h_flex()
                                 .child(
-                                    Label::new(format_timestamp(
-                                        timestamp,
-                                        now,
-                                        self.local_timezone,
-                                    ))
-                                    .color(Color::Muted),
+                                    div()
+                                        .id("notification_timestamp")
+                                        .hover(|style| {
+                                            style
+                                                .bg(cx.theme().colors().element_selected)
+                                                .rounded_md()
+                                        })
+                                        .child(Label::new(relative_timestamp).color(Color::Muted))
+                                        .tooltip(move |cx| {
+                                            Tooltip::text(absolute_timestamp.clone(), cx)
+                                        }),
                                 )
                                 .children(if let Some(is_accepted) = response {
                                     Some(div().flex().flex_grow().justify_end().child(Label::new(
@@ -357,7 +378,7 @@ impl NotificationPanel {
                         "{} invited you to join the #{channel_name} channel",
                         inviter.github_login
                     ),
-                    needs_response: channel_store.has_channel_invitation(channel_id),
+                    needs_response: channel_store.has_channel_invitation(ChannelId(channel_id)),
                     actor: Some(inviter),
                     can_navigate: false,
                 })
@@ -368,7 +389,7 @@ impl NotificationPanel {
                 message_id,
             } => {
                 let sender = user_store.get_cached_user(sender_id)?;
-                let channel = channel_store.channel_for_id(channel_id)?;
+                let channel = channel_store.channel_for_id(ChannelId(channel_id))?;
                 let message = self
                     .notification_store
                     .read(cx)
@@ -432,7 +453,7 @@ impl NotificationPanel {
                         if let Some(panel) = workspace.focus_panel::<ChatPanel>(cx) {
                             panel.update(cx, |panel, cx| {
                                 panel
-                                    .select_channel(channel_id, Some(message_id), cx)
+                                    .select_channel(ChannelId(channel_id), Some(message_id), cx)
                                     .detach_and_log_err(cx);
                             });
                         }
@@ -454,7 +475,7 @@ impl NotificationPanel {
                     panel.is_scrolled_to_bottom()
                         && panel
                             .active_chat()
-                            .map_or(false, |chat| chat.read(cx).channel_id == *channel_id)
+                            .map_or(false, |chat| chat.read(cx).channel_id.0 == *channel_id)
                 } else {
                     false
                 };
@@ -514,8 +535,10 @@ impl NotificationPanel {
 
         self.workspace
             .update(cx, |workspace, cx| {
-                workspace.dismiss_notification::<NotificationToast>(0, cx);
-                workspace.show_notification(0, cx, |cx| {
+                let id = NotificationId::unique::<NotificationToast>();
+
+                workspace.dismiss_notification(&id, cx);
+                workspace.show_notification(id, cx, |cx| {
                     let workspace = cx.view().downgrade();
                     cx.new_view(|_| NotificationToast {
                         notification_id,
@@ -534,7 +557,8 @@ impl NotificationPanel {
                 self.current_notification_toast.take();
                 self.workspace
                     .update(cx, |workspace, cx| {
-                        workspace.dismiss_notification::<NotificationToast>(0, cx)
+                        let id = NotificationId::unique::<NotificationToast>();
+                        workspace.dismiss_notification(&id, cx)
                     })
                     .ok();
             }
@@ -757,29 +781,3 @@ impl Render for NotificationToast {
 }
 
 impl EventEmitter<DismissEvent> for NotificationToast {}
-
-fn format_timestamp(
-    mut timestamp: OffsetDateTime,
-    mut now: OffsetDateTime,
-    local_timezone: UtcOffset,
-) -> String {
-    timestamp = timestamp.to_offset(local_timezone);
-    now = now.to_offset(local_timezone);
-
-    let today = now.date();
-    let date = timestamp.date();
-    if date == today {
-        let difference = now - timestamp;
-        if difference >= Duration::from_secs(3600) {
-            format!("{}h", difference.whole_seconds() / 3600)
-        } else if difference >= Duration::from_secs(60) {
-            format!("{}m", difference.whole_seconds() / 60)
-        } else {
-            "just now".to_string()
-        }
-    } else if date.next_day() == Some(today) {
-        format!("yesterday")
-    } else {
-        format!("{:02}/{}/{}", date.month() as u32, date.day(), date.year())
-    }
-}

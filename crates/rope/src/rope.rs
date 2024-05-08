@@ -4,7 +4,6 @@ mod point_utf16;
 mod unclipped;
 
 use arrayvec::ArrayString;
-use bromberg_sl2::HashMatrix;
 use smallvec::SmallVec;
 use std::{
     cmp, fmt, io, mem,
@@ -12,6 +11,7 @@ use std::{
     str,
 };
 use sum_tree::{Bias, Dimension, SumTree};
+use unicode_segmentation::GraphemeCursor;
 use util::debug_panic;
 
 pub use offset_utf16::OffsetUtf16;
@@ -23,13 +23,7 @@ pub use unclipped::Unclipped;
 const CHUNK_BASE: usize = 6;
 
 #[cfg(not(test))]
-const CHUNK_BASE: usize = 16;
-
-/// Type alias to [`HashMatrix`], an implementation of a homomorphic hash function. Two [`Rope`] instances
-/// containing the same text will produce the same fingerprint. This hash function is special in that
-/// it allows us to hash individual chunks and aggregate them up the [`Rope`]'s tree, with the resulting
-/// hash being equivalent to hashing all the text contained in the [`Rope`] at once.
-pub type RopeFingerprint = HashMatrix;
+const CHUNK_BASE: usize = 64;
 
 #[derive(Clone, Default)]
 pub struct Rope {
@@ -39,10 +33,6 @@ pub struct Rope {
 impl Rope {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn text_fingerprint(text: &str) -> RopeFingerprint {
-        bromberg_sl2::hash_strict(text.as_bytes())
     }
 
     pub fn append(&mut self, rope: Rope) {
@@ -84,48 +74,97 @@ impl Rope {
         self.slice(start..end)
     }
 
-    pub fn push(&mut self, text: &str) {
-        let mut new_chunks = SmallVec::<[_; 16]>::new();
-        let mut new_chunk = ArrayString::new();
-        for ch in text.chars() {
-            if new_chunk.len() + ch.len_utf8() > 2 * CHUNK_BASE {
-                new_chunks.push(Chunk(new_chunk));
-                new_chunk = ArrayString::new();
-            }
-
-            new_chunk.push(ch);
-        }
-        if !new_chunk.is_empty() {
-            new_chunks.push(Chunk(new_chunk));
-        }
-
-        let mut new_chunks = new_chunks.into_iter();
-        let mut first_new_chunk = new_chunks.next();
+    pub fn push(&mut self, mut text: &str) {
         self.chunks.update_last(
             |last_chunk| {
-                if let Some(first_new_chunk_ref) = first_new_chunk.as_mut() {
-                    if last_chunk.0.len() + first_new_chunk_ref.0.len() <= 2 * CHUNK_BASE {
-                        last_chunk.0.push_str(&first_new_chunk.take().unwrap().0);
-                    } else {
-                        let mut text = ArrayString::<{ 4 * CHUNK_BASE }>::new();
-                        text.push_str(&last_chunk.0);
-                        text.push_str(&first_new_chunk_ref.0);
-                        let (left, right) = text.split_at(find_split_ix(&text));
-                        last_chunk.0.clear();
-                        last_chunk.0.push_str(left);
-                        first_new_chunk_ref.0.clear();
-                        first_new_chunk_ref.0.push_str(right);
+                let split_ix = if last_chunk.0.len() + text.len() <= 2 * CHUNK_BASE {
+                    text.len()
+                } else {
+                    let mut split_ix =
+                        cmp::min(CHUNK_BASE.saturating_sub(last_chunk.0.len()), text.len());
+                    while !text.is_char_boundary(split_ix) {
+                        split_ix += 1;
                     }
-                }
+                    split_ix
+                };
+
+                let (suffix, remainder) = text.split_at(split_ix);
+                last_chunk.0.push_str(suffix);
+                text = remainder;
             },
             &(),
         );
 
-        self.chunks
-            .extend(first_new_chunk.into_iter().chain(new_chunks), &());
+        if text.len() > 2048 {
+            return self.push_large(text);
+        }
+        let mut new_chunks = SmallVec::<[_; 16]>::new();
+
+        while !text.is_empty() {
+            let mut split_ix = cmp::min(2 * CHUNK_BASE, text.len());
+            while !text.is_char_boundary(split_ix) {
+                split_ix -= 1;
+            }
+            let (chunk, remainder) = text.split_at(split_ix);
+            new_chunks.push(Chunk(ArrayString::from(chunk).unwrap()));
+            text = remainder;
+        }
+
+        #[cfg(test)]
+        const PARALLEL_THRESHOLD: usize = 4;
+        #[cfg(not(test))]
+        const PARALLEL_THRESHOLD: usize = 4 * (2 * sum_tree::TREE_BASE);
+
+        if new_chunks.len() >= PARALLEL_THRESHOLD {
+            self.chunks.par_extend(new_chunks.into_vec(), &());
+        } else {
+            self.chunks.extend(new_chunks, &());
+        }
+
         self.check_invariants();
     }
 
+    /// A copy of `push` specialized for working with large quantities of text.
+    fn push_large(&mut self, mut text: &str) {
+        // To avoid frequent reallocs when loading large swaths of file contents,
+        // we estimate worst-case `new_chunks` capacity;
+        // Chunk is a fixed-capacity buffer. If a character falls on
+        // chunk boundary, we push it off to the following chunk (thus leaving a small bit of capacity unfilled in current chunk).
+        // Worst-case chunk count when loading a file is then a case where every chunk ends up with that unused capacity.
+        // Since we're working with UTF-8, each character is at most 4 bytes wide. It follows then that the worst case is where
+        // a chunk ends with 3 bytes of a 4-byte character. These 3 bytes end up being stored in the following chunk, thus wasting
+        // 3 bytes of storage in current chunk.
+        // For example, a 1024-byte string can occupy between 32 (full ASCII, 1024/32) and 36 (full 4-byte UTF-8, 1024 / 29 rounded up) chunks.
+        const MIN_CHUNK_SIZE: usize = 2 * CHUNK_BASE - 3;
+
+        // We also round up the capacity up by one, for a good measure; we *really* don't want to realloc here, as we assume that the # of characters
+        // we're working with there is large.
+        let capacity = (text.len() + MIN_CHUNK_SIZE - 1) / MIN_CHUNK_SIZE;
+        let mut new_chunks = Vec::with_capacity(capacity);
+
+        while !text.is_empty() {
+            let mut split_ix = cmp::min(2 * CHUNK_BASE, text.len());
+            while !text.is_char_boundary(split_ix) {
+                split_ix -= 1;
+            }
+            let (chunk, remainder) = text.split_at(split_ix);
+            new_chunks.push(Chunk(ArrayString::from(chunk).unwrap()));
+            text = remainder;
+        }
+
+        #[cfg(test)]
+        const PARALLEL_THRESHOLD: usize = 4;
+        #[cfg(not(test))]
+        const PARALLEL_THRESHOLD: usize = 4 * (2 * sum_tree::TREE_BASE);
+
+        if new_chunks.len() >= PARALLEL_THRESHOLD {
+            self.chunks.par_extend(new_chunks, &());
+        } else {
+            self.chunks.extend(new_chunks, &());
+        }
+
+        self.check_invariants();
+    }
     pub fn push_front(&mut self, text: &str) {
         let suffix = mem::replace(self, Rope::from(text));
         self.append(suffix);
@@ -373,10 +412,6 @@ impl Rope {
     pub fn line_len(&self, row: u32) -> u32 {
         self.clip_point(Point::new(row, u32::MAX), Bias::Left)
             .column
-    }
-
-    pub fn fingerprint(&self) -> RopeFingerprint {
-        self.chunks.summary().fingerprint
     }
 }
 
@@ -874,14 +909,30 @@ impl Chunk {
     fn clip_point(&self, target: Point, bias: Bias) -> Point {
         for (row, line) in self.0.split('\n').enumerate() {
             if row == target.row as usize {
-                let mut column = target.column.min(line.len() as u32);
-                while !line.is_char_boundary(column as usize) {
+                let bytes = line.as_bytes();
+                let mut column = target.column.min(bytes.len() as u32) as usize;
+                if column == 0
+                    || column == bytes.len()
+                    || (bytes[column - 1] < 128 && bytes[column] < 128)
+                {
+                    return Point::new(row as u32, column as u32);
+                }
+
+                let mut grapheme_cursor = GraphemeCursor::new(column, bytes.len(), true);
+                loop {
+                    if line.is_char_boundary(column) {
+                        if grapheme_cursor.is_boundary(line, 0).unwrap_or(false) {
+                            break;
+                        }
+                    }
+
                     match bias {
                         Bias::Left => column -= 1,
                         Bias::Right => column += 1,
                     }
+                    grapheme_cursor.set_cursor(column);
                 }
-                return Point::new(row as u32, column);
+                return Point::new(row as u32, column as u32);
             }
         }
         unreachable!()
@@ -928,14 +979,12 @@ impl sum_tree::Item for Chunk {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChunkSummary {
     text: TextSummary,
-    fingerprint: RopeFingerprint,
 }
 
 impl<'a> From<&'a str> for ChunkSummary {
     fn from(text: &'a str) -> Self {
         Self {
             text: TextSummary::from(text),
-            fingerprint: Rope::text_fingerprint(text),
         }
     }
 }
@@ -945,19 +994,27 @@ impl sum_tree::Summary for ChunkSummary {
 
     fn add_summary(&mut self, summary: &Self, _: &()) {
         self.text += &summary.text;
-        self.fingerprint = self.fingerprint * summary.fingerprint;
     }
 }
 
+/// Summary of a string of text.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TextSummary {
+    /// Length in UTF-8
     pub len: usize,
+    /// Length in UTF-16 code units
     pub len_utf16: OffsetUtf16,
+    /// A point representing the number of lines and the length of the last line
     pub lines: Point,
+    /// How many `char`s are in the first line
     pub first_line_chars: u32,
+    /// How many `char`s are in the last line
     pub last_line_chars: u32,
+    /// How many UTF-16 code units are in the last line
     pub last_line_len_utf16: u32,
+    /// The row idx of the longest row
     pub longest_row: u32,
+    /// How many `char`s are in the longest row
     pub longest_row_chars: u32,
 }
 
@@ -1165,25 +1222,6 @@ impl TextDimension for PointUtf16 {
     fn add_assign(&mut self, other: &Self) {
         *self += other;
     }
-}
-
-fn find_split_ix(text: &str) -> usize {
-    let mut ix = text.len() / 2;
-    while !text.is_char_boundary(ix) {
-        if ix < 2 * CHUNK_BASE {
-            ix += 1;
-        } else {
-            ix = (text.len() / 2) - 1;
-            break;
-        }
-    }
-    while !text.is_char_boundary(ix) {
-        ix -= 1;
-    }
-
-    debug_assert!(ix <= 2 * CHUNK_BASE);
-    debug_assert!(text.len() - ix <= 2 * CHUNK_BASE);
-    ix
 }
 
 #[cfg(test)]

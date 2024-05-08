@@ -9,11 +9,11 @@ pub use line_layout::*;
 pub use line_wrapper::*;
 
 use crate::{
-    px, Bounds, DevicePixels, EntityId, Hsla, Pixels, PlatformTextSystem, Point, Result,
-    SharedString, Size, UnderlineStyle,
+    px, Bounds, DevicePixels, Hsla, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
+    StrikethroughStyle, UnderlineStyle,
 };
 use anyhow::anyhow;
-use collections::{BTreeSet, FxHashMap, FxHashSet};
+use collections::{BTreeSet, FxHashMap};
 use core::fmt;
 use derive_more::Deref;
 use itertools::Itertools;
@@ -24,7 +24,7 @@ use std::{
     cmp,
     fmt::{Debug, Display, Formatter},
     hash::{Hash, Hasher},
-    ops::{Deref, DerefMut},
+    ops::{Deref, DerefMut, Range},
     sync::Arc,
 };
 
@@ -63,7 +63,10 @@ impl TextSystem {
                 // TODO: This is currently Zed-specific.
                 // We should allow GPUI users to provide their own fallback font stack.
                 font("Zed Mono"),
-                font("Helvetica")
+                font("Helvetica"),
+                font("Cantarell"), // Gnome
+                font("Ubuntu"),    // Gnome (Ubuntu)
+                font("Noto Sans"), // KDE
             ],
         }
     }
@@ -112,6 +115,17 @@ impl TextSystem {
                 .insert(font.clone(), clone_font_id_result(&font_id));
             font_id
         }
+    }
+
+    /// Get the Font for the Font Id.
+    pub fn get_font_for_id(&self, id: FontId) -> Option<Font> {
+        let lock = self.font_ids_by_font.read();
+        lock.iter()
+            .filter_map(|(font, result)| match result {
+                Ok(font_id) if *font_id == id => Some(font.clone()),
+                _ => None,
+            })
+            .next()
     }
 
     /// Resolves the specified font, falling back to the default font stack if
@@ -276,7 +290,7 @@ impl TextSystem {
 /// The GPUI text layout subsystem.
 #[derive(Deref)]
 pub struct WindowTextSystem {
-    line_layout_cache: Arc<LineLayoutCache>,
+    line_layout_cache: LineLayoutCache,
     #[deref]
     text_system: Arc<TextSystem>,
 }
@@ -284,15 +298,21 @@ pub struct WindowTextSystem {
 impl WindowTextSystem {
     pub(crate) fn new(text_system: Arc<TextSystem>) -> Self {
         Self {
-            line_layout_cache: Arc::new(LineLayoutCache::new(
-                text_system.platform_text_system.clone(),
-            )),
+            line_layout_cache: LineLayoutCache::new(text_system.platform_text_system.clone()),
             text_system,
         }
     }
 
-    pub(crate) fn with_view<R>(&self, view_id: EntityId, f: impl FnOnce() -> R) -> R {
-        self.line_layout_cache.with_view(view_id, f)
+    pub(crate) fn layout_index(&self) -> LineLayoutIndex {
+        self.line_layout_cache.layout_index()
+    }
+
+    pub(crate) fn reuse_layouts(&self, index: Range<LineLayoutIndex>) {
+        self.line_layout_cache.reuse_layouts(index)
+    }
+
+    pub(crate) fn truncate_layouts(&self, index: LineLayoutIndex) {
+        self.line_layout_cache.truncate_layouts(index)
     }
 
     /// Shape the given line, at the given font_size, for painting to the screen.
@@ -317,6 +337,7 @@ impl WindowTextSystem {
             if let Some(last_run) = decoration_runs.last_mut() {
                 if last_run.color == run.color
                     && last_run.underline == run.underline
+                    && last_run.strikethrough == run.strikethrough
                     && last_run.background_color == run.background_color
                 {
                     last_run.len += run.len as u32;
@@ -328,6 +349,7 @@ impl WindowTextSystem {
                 color: run.color,
                 background_color: run.background_color,
                 underline: run.underline,
+                strikethrough: run.strikethrough,
             });
         }
 
@@ -382,6 +404,7 @@ impl WindowTextSystem {
                 if decoration_runs.last().map_or(false, |last_run| {
                     last_run.color == run.color
                         && last_run.underline == run.underline
+                        && last_run.strikethrough == run.strikethrough
                         && last_run.background_color == run.background_color
                 }) {
                     decoration_runs.last_mut().unwrap().len += run_len_within_line as u32;
@@ -391,6 +414,7 @@ impl WindowTextSystem {
                         color: run.color,
                         background_color: run.background_color,
                         underline: run.underline,
+                        strikethrough: run.strikethrough,
                     });
                 }
 
@@ -406,6 +430,7 @@ impl WindowTextSystem {
             let layout = self
                 .line_layout_cache
                 .layout_wrapped_line(&line_text, font_size, &font_runs, wrap_width);
+
             lines.push(WrappedLine {
                 layout,
                 decoration_runs,
@@ -447,8 +472,8 @@ impl WindowTextSystem {
         Ok(lines)
     }
 
-    pub(crate) fn finish_frame(&self, reused_views: &FxHashSet<EntityId>) {
-        self.line_layout_cache.finish_frame(reused_views)
+    pub(crate) fn finish_frame(&self) {
+        self.line_layout_cache.finish_frame()
     }
 
     /// Layout the given line of text, at the given font_size.
@@ -599,6 +624,8 @@ pub struct TextRun {
     pub background_color: Option<Hsla>,
     /// The underline style (if any)
     pub underline: Option<UnderlineStyle>,
+    /// The strikethrough style (if any)
+    pub strikethrough: Option<StrikethroughStyle>,
 }
 
 /// An identifier for a specific glyph, as returned by [`TextSystem::layout_line`].
@@ -652,6 +679,8 @@ impl Hash for RenderEmojiParams {
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct Font {
     /// The font family name.
+    ///
+    /// The special name ".SystemUIFont" is used to identify the system UI font, which varies based on platform.
     pub family: SharedString,
 
     /// The font features to use.
@@ -718,6 +747,7 @@ pub struct FontMetrics {
     pub(crate) x_height: f32,
 
     /// The outer limits of the area that the font covers.
+    /// Corresponds to the xMin / xMax / yMin / yMax values in the OpenType `head` table
     pub(crate) bounding_box: Bounds<f32>,
 }
 

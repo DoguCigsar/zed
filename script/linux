@@ -1,39 +1,128 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash
 
-# if not on Linux, do nothing
-[[ $(uname) == "Linux" ]] || exit 0
+set -e
+
+# Install our submodule dependencies
+git submodule update --init --recursive
+
+# install the wasm toolchain
+rustup target add wasm32-wasi
 
 # if sudo is not installed, define an empty alias
-maysudo=$(command -v sudo || true)
-export maysudo
+maysudo=$(command -v sudo || command -v doas || true)
 
 # Ubuntu, Debian, etc.
+# https://packages.ubuntu.com/
 apt=$(command -v apt-get || true)
-deps=(
-  libasound2-dev
-)
 if [[ -n $apt ]]; then
+  deps=(
+    gcc
+    g++
+    libasound2-dev
+    libfontconfig-dev
+    libwayland-dev
+    libxkbcommon-x11-dev
+    libssl-dev
+    libzstd-dev
+    libvulkan1
+    libgit2-dev
+  )
   $maysudo "$apt" install -y "${deps[@]}"
   exit 0
 fi
 
 # Fedora, CentOS, RHEL, etc.
+# https://packages.fedoraproject.org/
 dnf=$(command -v dnf || true)
-deps=(
-  alsa-lib-devel
-)
 if [[ -n $dnf ]]; then
+  deps=(
+    gcc
+    g++
+    alsa-lib-devel
+    fontconfig-devel
+    wayland-devel
+    libxkbcommon-x11-devel
+    openssl-devel
+    libzstd-devel
+    vulkan-loader
+  )
+
+  # libxkbcommon-x11-devel is in the crb repo on RHEL and CentOS, not needed for Fedora
+  if ! grep -q "Fedora" /etc/redhat-release; then
+    $maysudo "$dnf" config-manager --set-enabled crb
+  fi
+
   $maysudo "$dnf" install -y "${deps[@]}"
   exit 0
 fi
 
+# openSuse
+# https://software.opensuse.org/
+zyp=$(command -v zypper || true)
+if [[ -n $zyp ]]; then
+  deps=(
+    alsa-devel
+    fontconfig-devel
+    wayland-devel
+    libxkbcommon-x11-devel
+    openssl-devel
+    libzstd-devel
+    vulkan-loader
+  )
+  $maysudo "$zyp" install -y "${deps[@]}"
+  exit 0
+fi
+
 # Arch, Manjaro, etc.
+# https://archlinux.org/packages
 pacman=$(command -v pacman || true)
-deps=(
-  alsa-lib
-)
 if [[ -n $pacman ]]; then
-  $maysudo "$pacman" -S --noconfirm "${deps[@]}"
+  deps=(
+    alsa-lib
+    fontconfig
+    wayland
+    libxkbcommon-x11
+    openssl
+    zstd
+    pkgconf
+  )
+  $maysudo "$pacman" -S --needed --noconfirm "${deps[@]}"
+  exit 0
+fi
+
+# Void
+# https://voidlinux.org/packages/
+xbps=$(command -v xbps-install || true)
+if [[ -n $xbps ]]; then
+  deps=(
+    alsa-lib-devel
+    fontconfig-devel
+    libxcb-devel
+    libxkbcommon-devel
+    libzstd-devel
+    openssl-devel
+    wayland-devel
+    vulkan-loader
+  )
+  $maysudo "$xbps" -Syu "${deps[@]}"
+  exit 0
+fi
+
+# Gentoo
+# https://packages.gentoo.org/
+emerge=$(command -v emerge || true)
+if [[ -n $emerge ]]; then
+  deps=(
+    app-arch/zstd
+    dev-libs/openssl
+    dev-libs/wayland
+    media-libs/alsa-lib
+    media-libs/fontconfig
+    media-libs/vulkan-loader
+    x11-libs/libxcb
+    x11-libs/libxkbcommon
+  )
+  $maysudo "$emerge" -u "${deps[@]}"
   exit 0
 fi
 

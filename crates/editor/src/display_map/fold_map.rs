@@ -2,11 +2,10 @@ use super::{
     inlay_map::{InlayBufferRows, InlayChunks, InlayEdit, InlayOffset, InlayPoint, InlaySnapshot},
     Highlights,
 };
-use crate::{Anchor, AnchorRangeExt, MultiBufferSnapshot, ToOffset};
 use gpui::{ElementId, HighlightStyle, Hsla};
 use language::{Chunk, Edit, Point, TextSummary};
+use multi_buffer::{Anchor, AnchorRangeExt, MultiBufferSnapshot, ToOffset};
 use std::{
-    any::TypeId,
     cmp::{self, Ordering},
     iter,
     ops::{Add, AddAssign, Deref, DerefMut, Range, Sub},
@@ -178,6 +177,9 @@ impl<'a> FoldMapWriter<'a> {
     }
 }
 
+/// Decides where the fold indicators should be; also tracks parts of a source file that are currently folded.
+///
+/// See the [`display_map` module documentation](crate::display_map) for more information.
 pub(crate) struct FoldMap {
     snapshot: FoldSnapshot,
     ellipses_color: Option<Hsla>,
@@ -230,11 +232,11 @@ impl FoldMap {
     }
 
     pub fn set_ellipses_color(&mut self, color: Hsla) -> bool {
-        if self.ellipses_color != Some(color) {
+        if self.ellipses_color == Some(color) {
+            false
+        } else {
             self.ellipses_color = Some(color);
             true
-        } else {
-            false
         }
     }
 
@@ -881,10 +883,10 @@ impl sum_tree::Item for Fold {
 
     fn summary(&self) -> Self::Summary {
         FoldSummary {
-            start: self.range.start.clone(),
-            end: self.range.end.clone(),
-            min_start: self.range.start.clone(),
-            max_end: self.range.end.clone(),
+            start: self.range.start,
+            end: self.range.end,
+            min_start: self.range.start,
+            max_end: self.range.end,
             count: 1,
         }
     }
@@ -916,10 +918,10 @@ impl sum_tree::Summary for FoldSummary {
 
     fn add_summary(&mut self, other: &Self, buffer: &Self::Context) {
         if other.min_start.cmp(&self.min_start, buffer) == Ordering::Less {
-            self.min_start = other.min_start.clone();
+            self.min_start = other.min_start;
         }
         if other.max_end.cmp(&self.max_end, buffer) == Ordering::Greater {
-            self.max_end = other.max_end.clone();
+            self.max_end = other.max_end;
         }
 
         #[cfg(debug_assertions)]
@@ -931,16 +933,16 @@ impl sum_tree::Summary for FoldSummary {
             }
         }
 
-        self.start = other.start.clone();
-        self.end = other.end.clone();
+        self.start = other.start;
+        self.end = other.end;
         self.count += other.count;
     }
 }
 
 impl<'a> sum_tree::Dimension<'a, FoldSummary> for FoldRange {
     fn add_summary(&mut self, summary: &'a FoldSummary, _: &MultiBufferSnapshot) {
-        self.0.start = summary.start.clone();
-        self.0.end = summary.end.clone();
+        self.0.start = summary.start;
+        self.0.end = summary.end;
     }
 }
 
@@ -1060,28 +1062,6 @@ impl<'a> Iterator for FoldChunks<'a> {
         }
 
         None
-    }
-}
-
-#[derive(Copy, Clone, Eq, PartialEq)]
-struct HighlightEndpoint {
-    offset: InlayOffset,
-    is_start: bool,
-    tag: Option<TypeId>,
-    style: HighlightStyle,
-}
-
-impl PartialOrd for HighlightEndpoint {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for HighlightEndpoint {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.offset
-            .cmp(&other.offset)
-            .then_with(|| other.is_start.cmp(&self.is_start))
     }
 }
 

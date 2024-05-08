@@ -1,9 +1,9 @@
 mod assets;
 mod color;
-mod util;
 mod vscode;
 
 use std::fs::File;
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -75,6 +75,10 @@ struct Args {
     #[arg(long)]
     warn_on_missing: bool,
 
+    /// The path to write the output to.
+    #[arg(long, short)]
+    output: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -135,7 +139,7 @@ fn main() -> Result<()> {
         .context(format!("failed to parse theme {theme_file_path:?}"))?;
 
     let theme_metadata = ThemeMetadata {
-        name: "".to_string(),
+        name: vscode_theme.name.clone().unwrap_or("".to_string()),
         appearance: ThemeAppearanceJson::Dark,
         file_name: "".to_string(),
     };
@@ -146,7 +150,12 @@ fn main() -> Result<()> {
 
     let theme_json = serde_json::to_string_pretty(&theme).unwrap();
 
-    println!("{}", theme_json);
+    if let Some(output) = args.output {
+        let mut file = File::create(output)?;
+        file.write_all(theme_json.as_bytes())?;
+    } else {
+        println!("{}", theme_json);
+    }
 
     log::info!("Done!");
 

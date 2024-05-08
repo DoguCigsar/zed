@@ -1,24 +1,26 @@
+mod copilot_completion_provider;
 pub mod request;
+mod sign_in;
+
 use anyhow::{anyhow, Context as _, Result};
-use async_compression::futures::bufread::GzipDecoder;
-use async_tar::Archive;
 use collections::{HashMap, HashSet};
+use command_palette_hooks::CommandPaletteFilter;
 use futures::{channel::oneshot, future::Shared, Future, FutureExt, TryFutureExt};
 use gpui::{
     actions, AppContext, AsyncAppContext, Context, Entity, EntityId, EventEmitter, Global, Model,
     ModelContext, Task, WeakModel,
 };
 use language::{
-    language_settings::{all_language_settings, language_settings},
-    point_from_lsp, point_to_lsp, Anchor, Bias, Buffer, BufferSnapshot, Language,
-    LanguageServerName, PointUtf16, ToPointUtf16,
+    language_settings::{all_language_settings, language_settings, InlineCompletionProvider},
+    point_from_lsp, point_to_lsp, Anchor, Bias, Buffer, BufferSnapshot, Language, PointUtf16,
+    ToPointUtf16,
 };
 use lsp::{LanguageServer, LanguageServerBinary, LanguageServerId};
 use node_runtime::NodeRuntime;
 use parking_lot::Mutex;
 use request::StatusNotification;
 use settings::SettingsStore;
-use smol::{fs, io::BufReader, stream::StreamExt};
+use smol::{fs, stream::StreamExt};
 use std::{
     any::TypeId,
     ffi::OsString,
@@ -28,21 +30,12 @@ use std::{
     sync::Arc,
 };
 use util::{
-    async_maybe, fs::remove_matching, github::latest_github_release, http::HttpClient, paths,
-    ResultExt,
+    fs::remove_matching, github::latest_github_release, http::HttpClient, maybe, paths, ResultExt,
 };
 
-// HACK: This type is only defined in `copilot` since it is the earliest ancestor
-// of the crates that use it.
-//
-// This is not great. Let's find a better place for it to live.
-#[derive(Default)]
-pub struct CommandPaletteFilter {
-    pub hidden_namespaces: HashSet<&'static str>,
-    pub hidden_action_types: HashSet<TypeId>,
-}
+pub use copilot_completion_provider::CopilotCompletionProvider;
+pub use sign_in::CopilotCodeVerification;
 
-impl Global for CommandPaletteFilter {}
 actions!(
     copilot,
     [
@@ -76,33 +69,26 @@ pub fn init(
         let copilot_auth_action_types = [TypeId::of::<SignOut>()];
         let copilot_no_auth_action_types = [TypeId::of::<SignIn>()];
         let status = handle.read(cx).status();
-        let filter = cx.default_global::<CommandPaletteFilter>();
+        let filter = CommandPaletteFilter::global_mut(cx);
 
         match status {
             Status::Disabled => {
-                filter.hidden_action_types.extend(copilot_action_types);
-                filter.hidden_action_types.extend(copilot_auth_action_types);
-                filter
-                    .hidden_action_types
-                    .extend(copilot_no_auth_action_types);
+                filter.hide_action_types(&copilot_action_types);
+                filter.hide_action_types(&copilot_auth_action_types);
+                filter.hide_action_types(&copilot_no_auth_action_types);
             }
             Status::Authorized => {
-                filter
-                    .hidden_action_types
-                    .extend(copilot_no_auth_action_types);
-                for type_id in copilot_action_types
-                    .iter()
-                    .chain(&copilot_auth_action_types)
-                {
-                    filter.hidden_action_types.remove(type_id);
-                }
+                filter.hide_action_types(&copilot_no_auth_action_types);
+                filter.show_action_types(
+                    copilot_action_types
+                        .iter()
+                        .chain(&copilot_auth_action_types),
+                );
             }
             _ => {
-                filter.hidden_action_types.extend(copilot_action_types);
-                filter.hidden_action_types.extend(copilot_auth_action_types);
-                for type_id in &copilot_no_auth_action_types {
-                    filter.hidden_action_types.remove(type_id);
-                }
+                filter.hide_action_types(&copilot_action_types);
+                filter.hide_action_types(&copilot_auth_action_types);
+                filter.show_action_types(copilot_no_auth_action_types.iter());
             }
         }
     })
@@ -162,7 +148,6 @@ impl CopilotServer {
 }
 
 struct RunningCopilotServer {
-    name: LanguageServerName,
     lsp: Arc<LanguageServer>,
     sign_in_status: SignInStatus,
     registered_buffers: HashMap<EntityId, RegisteredBuffer>,
@@ -372,7 +357,9 @@ impl Copilot {
         let server_id = self.server_id;
         let http = self.http.clone();
         let node_runtime = self.node_runtime.clone();
-        if all_language_settings(None, cx).copilot_enabled(None, None) {
+        if all_language_settings(None, cx).inline_completions.provider
+            == InlineCompletionProvider::Copilot
+        {
             if matches!(self.server, CopilotServer::Disabled) {
                 let start_task = cx
                     .spawn(move |this, cx| {
@@ -393,8 +380,17 @@ impl Copilot {
         use lsp::FakeLanguageServer;
         use node_runtime::FakeNodeRuntime;
 
-        let (server, fake_server) =
-            FakeLanguageServer::new("copilot".into(), Default::default(), cx.to_async());
+        let (server, fake_server) = FakeLanguageServer::new(
+            LanguageServerId(0),
+            LanguageServerBinary {
+                path: "path/to/copilot".into(),
+                arguments: vec![],
+                env: None,
+            },
+            "copilot".into(),
+            Default::default(),
+            cx.to_async(),
+        );
         let http = util::http::FakeHttpClient::create(|_| async { unreachable!() });
         let node_runtime = FakeNodeRuntime::new();
         let this = cx.new_model(|cx| Self {
@@ -402,7 +398,6 @@ impl Copilot {
             http: http.clone(),
             node_runtime,
             server: CopilotServer::Running(RunningCopilotServer {
-                name: LanguageServerName(Arc::from("copilot")),
                 lsp: Arc::new(server),
                 sign_in_status: SignInStatus::Authorized,
                 registered_buffers: Default::default(),
@@ -428,13 +423,20 @@ impl Copilot {
                 let binary = LanguageServerBinary {
                     path: node_path,
                     arguments,
+                    // TODO: We could set HTTP_PROXY etc here and fix the copilot issue.
+                    env: None,
                 };
+
+                #[cfg(not(windows))]
+                let root_path = Path::new("/");
+                #[cfg(windows)]
+                let root_path = Path::new("C:/");
 
                 let server = LanguageServer::new(
                     Arc::new(Mutex::new(None)),
                     new_server_id,
                     binary,
-                    Path::new("/"),
+                    root_path,
                     None,
                     cx.clone(),
                 )?;
@@ -444,7 +446,6 @@ impl Copilot {
                         |_, _| { /* Silence the notification */ },
                     )
                     .detach();
-
                 let server = cx.update(|cx| server.initialize(None, cx))?.await?;
 
                 let status = server
@@ -475,7 +476,6 @@ impl Copilot {
                 match server {
                     Ok((server, status)) => {
                         this.server = CopilotServer::Running(RunningCopilotServer {
-                            name: LanguageServerName(Arc::from("copilot")),
                             lsp: server,
                             sign_in_status: SignInStatus::SignedOut,
                             registered_buffers: Default::default(),
@@ -513,7 +513,7 @@ impl Copilot {
                                     .await?;
                                 match sign_in {
                                     request::SignInInitiateResult::AlreadySignedIn { user } => {
-                                        Ok(request::SignInStatus::Ok { user })
+                                        Ok(request::SignInStatus::Ok { user: Some(user) })
                                     }
                                     request::SignInInitiateResult::PromptUserDeviceFlow(flow) => {
                                         this.update(&mut cx, |this, cx| {
@@ -615,9 +615,9 @@ impl Copilot {
         cx.background_executor().spawn(start_task)
     }
 
-    pub fn language_server(&self) -> Option<(&LanguageServerName, &Arc<LanguageServer>)> {
+    pub fn language_server(&self) -> Option<&Arc<LanguageServer>> {
         if let CopilotServer::Running(server) = &self.server {
-            Some((&server.name, &server.lsp))
+            Some(&server.lsp)
         } else {
             None
         }
@@ -806,7 +806,7 @@ impl Copilot {
     ) -> Task<Result<()>> {
         let server = match self.server.as_authenticated() {
             Ok(server) => server,
-            Err(error) => return Task::ready(Err(error)),
+            Err(_) => return Task::ready(Ok(())),
         };
         let request =
             server
@@ -921,7 +921,7 @@ impl Copilot {
 
         if let Ok(server) = self.server.as_running() {
             match lsp_status {
-                request::SignInStatus::Ok { .. }
+                request::SignInStatus::Ok { user: Some(_) }
                 | request::SignInStatus::MaybeOk { .. }
                 | request::SignInStatus::AlreadySignedIn { .. } => {
                     server.sign_in_status = SignInStatus::Authorized;
@@ -937,7 +937,7 @@ impl Copilot {
                         self.unregister_buffer(&buffer);
                     }
                 }
-                request::SignInStatus::NotSignedIn => {
+                request::SignInStatus::Ok { user: None } | request::SignInStatus::NotSignedIn => {
                     server.sign_in_status = SignInStatus::SignedOut;
                     for buffer in self.buffers.iter().cloned().collect::<Vec<_>>() {
                         self.unregister_buffer(&buffer);
@@ -951,12 +951,9 @@ impl Copilot {
 }
 
 fn id_for_language(language: Option<&Arc<Language>>) -> String {
-    let language_name = language.map(|language| language.name());
-    match language_name.as_deref() {
-        Some("Plain Text") => "plaintext".to_string(),
-        Some(language_name) => language_name.to_lowercase(),
-        None => "plaintext".to_string(),
-    }
+    language
+        .map(|language| language.lsp_id())
+        .unwrap_or_else(|| "plaintext".to_string())
 }
 
 fn uri_for_buffer(buffer: &Model<Buffer>, cx: &AppContext) -> lsp::Url {
@@ -972,13 +969,14 @@ async fn clear_copilot_dir() {
 }
 
 async fn get_copilot_lsp(http: Arc<dyn HttpClient>) -> anyhow::Result<PathBuf> {
-    const SERVER_PATH: &'static str = "dist/agent.js";
+    const SERVER_PATH: &str = "dist/agent.js";
 
     ///Check for the latest copilot language server and download it if we haven't already
     async fn fetch_latest(http: Arc<dyn HttpClient>) -> anyhow::Result<PathBuf> {
-        let release = latest_github_release("zed-industries/copilot", false, http.clone()).await?;
+        let release =
+            latest_github_release("zed-industries/copilot", true, false, http.clone()).await?;
 
-        let version_dir = &*paths::COPILOT_DIR.join(format!("copilot-{}", release.name));
+        let version_dir = &*paths::COPILOT_DIR.join(format!("copilot-{}", release.tag_name));
 
         fs::create_dir_all(version_dir).await?;
         let server_path = version_dir.join(SERVER_PATH);
@@ -997,11 +995,9 @@ async fn get_copilot_lsp(http: Arc<dyn HttpClient>) -> anyhow::Result<PathBuf> {
             let mut response = http
                 .get(url, Default::default(), true)
                 .await
-                .map_err(|err| anyhow!("error downloading copilot release: {}", err))?;
-            let decompressed_bytes = GzipDecoder::new(BufReader::new(response.body_mut()));
-            let archive = Archive::new(decompressed_bytes);
-            archive.unpack(dist_dir).await?;
+                .context("error downloading copilot release")?;
 
+            archive::extract_tar_gz(&dist_dir, response.body_mut()).await?;
             remove_matching(&paths::COPILOT_DIR, |entry| entry != version_dir).await;
         }
 
@@ -1013,7 +1009,7 @@ async fn get_copilot_lsp(http: Arc<dyn HttpClient>) -> anyhow::Result<PathBuf> {
         e @ Err(..) => {
             e.log_err();
             // Fetch a cached binary, if it exists
-            async_maybe!({
+            maybe!(async {
                 let mut last_version_dir = None;
                 let mut entries = fs::read_dir(paths::COPILOT_DIR.as_path()).await?;
                 while let Some(entry) = entries.next().await {
@@ -1049,9 +1045,7 @@ mod tests {
     async fn test_buffer_management(cx: &mut TestAppContext) {
         let (copilot, mut lsp) = Copilot::fake(cx);
 
-        let buffer_1 = cx.new_model(|cx| {
-            Buffer::new(0, BufferId::new(cx.entity_id().as_u64()).unwrap(), "Hello")
-        });
+        let buffer_1 = cx.new_model(|cx| Buffer::local("Hello", cx));
         let buffer_1_uri: lsp::Url = format!("buffer://{}", buffer_1.entity_id().as_u64())
             .parse()
             .unwrap();
@@ -1069,13 +1063,7 @@ mod tests {
             }
         );
 
-        let buffer_2 = cx.new_model(|cx| {
-            Buffer::new(
-                0,
-                BufferId::new(cx.entity_id().as_u64()).unwrap(),
-                "Goodbye",
-            )
-        });
+        let buffer_2 = cx.new_model(|cx| Buffer::local("Goodbye", cx));
         let buffer_2_uri: lsp::Url = format!("buffer://{}", buffer_2.entity_id().as_u64())
             .parse()
             .unwrap();
@@ -1220,7 +1208,7 @@ mod tests {
             Some(self)
         }
 
-        fn mtime(&self) -> std::time::SystemTime {
+        fn mtime(&self) -> Option<std::time::SystemTime> {
             unimplemented!()
         }
 
@@ -1270,9 +1258,8 @@ mod tests {
             &self,
             _: BufferId,
             _: &clock::Global,
-            _: language::RopeFingerprint,
             _: language::LineEnding,
-            _: std::time::SystemTime,
+            _: Option<std::time::SystemTime>,
             _: &mut AppContext,
         ) {
             unimplemented!()

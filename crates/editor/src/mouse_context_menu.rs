@@ -1,13 +1,39 @@
 use crate::{
-    DisplayPoint, Editor, EditorMode, FindAllReferences, GoToDefinition, GoToTypeDefinition,
-    Rename, RevealInFinder, SelectMode, ToggleCodeActions,
+    DisplayPoint, Editor, EditorMode, FindAllReferences, GoToDefinition, GoToImplementation,
+    GoToTypeDefinition, Rename, RevealInFinder, SelectMode, ToggleCodeActions,
 };
 use gpui::{DismissEvent, Pixels, Point, Subscription, View, ViewContext};
+use workspace::OpenInTerminal;
 
 pub struct MouseContextMenu {
     pub(crate) position: Point<Pixels>,
     pub(crate) context_menu: View<ui::ContextMenu>,
     _subscription: Subscription,
+}
+
+impl MouseContextMenu {
+    pub(crate) fn new(
+        position: Point<Pixels>,
+        context_menu: View<ui::ContextMenu>,
+        cx: &mut ViewContext<Editor>,
+    ) -> Self {
+        let context_menu_focus = context_menu.focus_handle(cx);
+        cx.focus(&context_menu_focus);
+
+        let _subscription =
+            cx.subscribe(&context_menu, move |this, _, _event: &DismissEvent, cx| {
+                this.mouse_context_menu.take();
+                if context_menu_focus.contains_focused(cx) {
+                    this.focus(cx);
+                }
+            });
+
+        Self {
+            position,
+            context_menu,
+            _subscription,
+        }
+    }
 }
 
 pub fn deploy_context_menu(
@@ -48,32 +74,21 @@ pub fn deploy_context_menu(
             menu.action("Rename Symbol", Box::new(Rename))
                 .action("Go to Definition", Box::new(GoToDefinition))
                 .action("Go to Type Definition", Box::new(GoToTypeDefinition))
+                .action("Go to Implementation", Box::new(GoToImplementation))
                 .action("Find All References", Box::new(FindAllReferences))
                 .action(
                     "Code Actions",
                     Box::new(ToggleCodeActions {
-                        deployed_from_indicator: false,
+                        deployed_from_indicator: None,
                     }),
                 )
                 .separator()
                 .action("Reveal in Finder", Box::new(RevealInFinder))
+                .action("Open in Terminal", Box::new(OpenInTerminal))
         })
     };
-    let context_menu_focus = context_menu.focus_handle(cx);
-    cx.focus(&context_menu_focus);
-
-    let _subscription = cx.subscribe(&context_menu, move |this, _, _event: &DismissEvent, cx| {
-        this.mouse_context_menu.take();
-        if context_menu_focus.contains_focused(cx) {
-            this.focus(cx);
-        }
-    });
-
-    editor.mouse_context_menu = Some(MouseContextMenu {
-        position,
-        context_menu,
-        _subscription,
-    });
+    let mouse_context_menu = MouseContextMenu::new(position, context_menu, cx);
+    editor.mouse_context_menu = Some(mouse_context_menu);
     cx.notify();
 }
 

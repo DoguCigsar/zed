@@ -5,38 +5,42 @@ edition = "2021"
 publish = false
 license = "GPL-3.0-or-later"
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/diagnostics.rs"
 doctest = false
 
 [dependencies]
 anyhow.workspace = true
-collections = { path = "../collections" }
-editor = { path = "../editor" }
+collections.workspace = true
+ctor.workspace = true
+editor.workspace = true
+env_logger.workspace = true
 futures.workspace = true
-gpui = { path = "../gpui" }
-language = { path = "../language" }
+gpui.workspace = true
+language.workspace = true
 log.workspace = true
-lsp = { path = "../lsp" }
-postage.workspace = true
-project = { path = "../project" }
+lsp.workspace = true
+project.workspace = true
+rand.workspace = true
 schemars.workspace = true
 serde.workspace = true
-serde_derive.workspace = true
-settings = { path = "../settings" }
-smallvec.workspace = true
-theme = { path = "../theme" }
-ui = { path = "../ui" }
-util = { path = "../util" }
-workspace = { path = "../workspace" }
+settings.workspace = true
+theme.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
 
 [dev-dependencies]
-client = { path = "../client", features = ["test-support"] }
-editor = { path = "../editor", features = ["test-support"] }
-gpui = { path = "../gpui", features = ["test-support"] }
-language = { path = "../language", features = ["test-support"] }
-lsp = { path = "../lsp", features = ["test-support"] }
+client = { workspace = true, features = ["test-support"] }
+editor = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
+lsp = { workspace = true, features = ["test-support"] }
 serde_json.workspace = true
-theme = { path = "../theme", features = ["test-support"] }
+theme = { workspace = true, features = ["test-support"] }
 unindent.workspace = true
-workspace = { path = "../workspace", features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }
+pretty_assertions.workspace = true

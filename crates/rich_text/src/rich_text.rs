@@ -1,7 +1,7 @@
 use futures::FutureExt;
 use gpui::{
-    AnyElement, ElementId, FontStyle, FontWeight, HighlightStyle, InteractiveText, IntoElement,
-    SharedString, StyledText, UnderlineStyle, WindowContext,
+    AnyElement, AnyView, ElementId, FontStyle, FontWeight, HighlightStyle, InteractiveText,
+    IntoElement, SharedString, StrikethroughStyle, StyledText, UnderlineStyle, WindowContext,
 };
 use language::{HighlightId, Language, LanguageRegistry};
 use std::{ops::Range, sync::Arc};
@@ -31,12 +31,29 @@ impl From<HighlightId> for Highlight {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RichText {
     pub text: SharedString,
     pub highlights: Vec<(Range<usize>, Highlight)>,
     pub link_ranges: Vec<Range<usize>>,
     pub link_urls: Arc<[String]>,
+
+    pub custom_ranges: Vec<Range<usize>>,
+    custom_ranges_tooltip_fn:
+        Option<Arc<dyn Fn(usize, Range<usize>, &mut WindowContext) -> Option<AnyView>>>,
+}
+
+impl Default for RichText {
+    fn default() -> Self {
+        Self {
+            text: SharedString::default(),
+            highlights: Vec::new(),
+            link_ranges: Vec::new(),
+            link_urls: Arc::from([]),
+            custom_ranges: Vec::new(),
+            custom_ranges_tooltip_fn: None,
+        }
+    }
 }
 
 /// Allows one to specify extra links to the rendered markdown, which can be used
@@ -48,7 +65,45 @@ pub struct Mention {
 }
 
 impl RichText {
-    pub fn element(&self, id: ElementId, cx: &WindowContext) -> AnyElement {
+    pub fn new(
+        block: String,
+        mentions: &[Mention],
+        language_registry: &Arc<LanguageRegistry>,
+    ) -> Self {
+        let mut text = String::new();
+        let mut highlights = Vec::new();
+        let mut link_ranges = Vec::new();
+        let mut link_urls = Vec::new();
+        render_markdown_mut(
+            &block,
+            mentions,
+            language_registry,
+            None,
+            &mut text,
+            &mut highlights,
+            &mut link_ranges,
+            &mut link_urls,
+        );
+        text.truncate(text.trim_end().len());
+
+        RichText {
+            text: SharedString::from(text),
+            link_urls: link_urls.into(),
+            link_ranges,
+            highlights,
+            custom_ranges: Vec::new(),
+            custom_ranges_tooltip_fn: None,
+        }
+    }
+
+    pub fn set_tooltip_builder_for_custom_ranges(
+        &mut self,
+        f: impl Fn(usize, Range<usize>, &mut WindowContext) -> Option<AnyView> + 'static,
+    ) {
+        self.custom_ranges_tooltip_fn = Some(Arc::new(f));
+    }
+
+    pub fn element(&self, id: ElementId, cx: &mut WindowContext) -> AnyElement {
         let theme = cx.theme();
         let code_background = theme.colors().surface_background;
 
@@ -69,18 +124,18 @@ impl RichText {
                                 ..id.style(theme.syntax()).unwrap_or_default()
                             },
                             Highlight::InlineCode(link) => {
-                                if !*link {
-                                    HighlightStyle {
-                                        background_color: Some(code_background),
-                                        ..Default::default()
-                                    }
-                                } else {
+                                if *link {
                                     HighlightStyle {
                                         background_color: Some(code_background),
                                         underline: Some(UnderlineStyle {
                                             thickness: 1.0.into(),
                                             ..Default::default()
                                         }),
+                                        ..Default::default()
+                                    }
+                                } else {
+                                    HighlightStyle {
+                                        background_color: Some(code_background),
                                         ..Default::default()
                                     }
                                 }
@@ -111,10 +166,19 @@ impl RichText {
         .tooltip({
             let link_ranges = self.link_ranges.clone();
             let link_urls = self.link_urls.clone();
+            let custom_tooltip_ranges = self.custom_ranges.clone();
+            let custom_tooltip_fn = self.custom_ranges_tooltip_fn.clone();
             move |idx, cx| {
                 for (ix, range) in link_ranges.iter().enumerate() {
                     if range.contains(&idx) {
                         return Some(LinkPreview::new(&link_urls[ix], cx));
+                    }
+                }
+                for range in &custom_tooltip_ranges {
+                    if range.contains(&idx) {
+                        if let Some(f) = &custom_tooltip_fn {
+                            return f(idx, range.clone(), cx);
+                        }
                     }
                 }
                 None
@@ -124,6 +188,7 @@ impl RichText {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_markdown_mut(
     block: &str,
     mut mentions: &[Mention],
@@ -134,10 +199,11 @@ pub fn render_markdown_mut(
     link_ranges: &mut Vec<Range<usize>>,
     link_urls: &mut Vec<String>,
 ) {
-    use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
+    use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
     let mut bold_depth = 0;
     let mut italic_depth = 0;
+    let mut strikethrough_depth = 0;
     let mut link_url = None;
     let mut current_language = None;
     let mut list_stack = Vec::new();
@@ -175,19 +241,60 @@ pub fn render_markdown_mut(
                     if italic_depth > 0 {
                         style.font_style = Some(FontStyle::Italic);
                     }
-                    if let Some(link_url) = link_url.clone() {
+                    if strikethrough_depth > 0 {
+                        style.strikethrough = Some(StrikethroughStyle {
+                            thickness: 1.0.into(),
+                            ..Default::default()
+                        });
+                    }
+                    let last_run_len = if let Some(link_url) = link_url.clone() {
                         link_ranges.push(prev_len..text.len());
                         link_urls.push(link_url);
                         style.underline = Some(UnderlineStyle {
                             thickness: 1.0.into(),
                             ..Default::default()
                         });
-                    }
+                        prev_len
+                    } else {
+                        // Manually scan for links
+                        let mut finder = linkify::LinkFinder::new();
+                        finder.kinds(&[linkify::LinkKind::Url]);
+                        let mut last_link_len = prev_len;
+                        for link in finder.links(&t) {
+                            let start = link.start();
+                            let end = link.end();
+                            let range = (prev_len + start)..(prev_len + end);
+                            link_ranges.push(range.clone());
+                            link_urls.push(link.as_str().to_string());
 
-                    if style != HighlightStyle::default() {
+                            // If there is a style before we match a link, we have to add this to the highlighted ranges
+                            if style != HighlightStyle::default() && last_link_len < link.start() {
+                                highlights.push((
+                                    last_link_len..link.start(),
+                                    Highlight::Highlight(style),
+                                ));
+                            }
+
+                            highlights.push((
+                                range,
+                                Highlight::Highlight(HighlightStyle {
+                                    underline: Some(UnderlineStyle {
+                                        thickness: 1.0.into(),
+                                        ..Default::default()
+                                    }),
+                                    ..style
+                                }),
+                            ));
+
+                            last_link_len = end;
+                        }
+                        last_link_len
+                    };
+
+                    if style != HighlightStyle::default() && last_run_len < text.len() {
                         let mut new_highlight = true;
                         if let Some((last_range, last_style)) = highlights.last_mut() {
-                            if last_range.end == prev_len
+                            if last_range.end == last_run_len
                                 && last_style == &Highlight::Highlight(style)
                             {
                                 last_range.end = text.len();
@@ -195,7 +302,8 @@ pub fn render_markdown_mut(
                             }
                         }
                         if new_highlight {
-                            highlights.push((prev_len..text.len(), Highlight::Highlight(style)));
+                            highlights
+                                .push((last_run_len..text.len(), Highlight::Highlight(style)));
                         }
                     }
                 }
@@ -213,7 +321,12 @@ pub fn render_markdown_mut(
             }
             Event::Start(tag) => match tag {
                 Tag::Paragraph => new_paragraph(text, &mut list_stack),
-                Tag::Heading(_, _, _) => {
+                Tag::Heading {
+                    level: _,
+                    id: _,
+                    classes: _,
+                    attrs: _,
+                } => {
                     new_paragraph(text, &mut list_stack);
                     bold_depth += 1;
                 }
@@ -230,7 +343,13 @@ pub fn render_markdown_mut(
                 }
                 Tag::Emphasis => italic_depth += 1,
                 Tag::Strong => bold_depth += 1,
-                Tag::Link(_, url, _) => link_url = Some(url.to_string()),
+                Tag::Strikethrough => strikethrough_depth += 1,
+                Tag::Link {
+                    link_type: _,
+                    dest_url,
+                    title: _,
+                    id: _,
+                } => link_url = Some(dest_url.to_string()),
                 Tag::List(number) => {
                     list_stack.push((number, false));
                 }
@@ -256,48 +375,19 @@ pub fn render_markdown_mut(
                 _ => {}
             },
             Event::End(tag) => match tag {
-                Tag::Heading(_, _, _) => bold_depth -= 1,
-                Tag::CodeBlock(_) => current_language = None,
-                Tag::Emphasis => italic_depth -= 1,
-                Tag::Strong => bold_depth -= 1,
-                Tag::Link(_, _, _) => link_url = None,
-                Tag::List(_) => drop(list_stack.pop()),
+                TagEnd::Heading(_) => bold_depth -= 1,
+                TagEnd::CodeBlock => current_language = None,
+                TagEnd::Emphasis => italic_depth -= 1,
+                TagEnd::Strong => bold_depth -= 1,
+                TagEnd::Strikethrough => strikethrough_depth -= 1,
+                TagEnd::Link => link_url = None,
+                TagEnd::List(_) => drop(list_stack.pop()),
                 _ => {}
             },
             Event::HardBreak => text.push('\n'),
             Event::SoftBreak => text.push('\n'),
             _ => {}
         }
-    }
-}
-
-pub fn render_rich_text(
-    block: String,
-    mentions: &[Mention],
-    language_registry: &Arc<LanguageRegistry>,
-    language: Option<&Arc<Language>>,
-) -> RichText {
-    let mut text = String::new();
-    let mut highlights = Vec::new();
-    let mut link_ranges = Vec::new();
-    let mut link_urls = Vec::new();
-    render_markdown_mut(
-        &block,
-        mentions,
-        language_registry,
-        language,
-        &mut text,
-        &mut highlights,
-        &mut link_ranges,
-        &mut link_urls,
-    );
-    text.truncate(text.trim_end().len());
-
-    RichText {
-        text: SharedString::from(text),
-        link_urls: link_urls.into(),
-        link_ranges,
-        highlights,
     }
 }
 

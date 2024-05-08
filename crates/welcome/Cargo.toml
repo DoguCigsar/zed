@@ -5,6 +5,9 @@ edition = "2021"
 publish = false
 license = "GPL-3.0-or-later"
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/welcome.rs"
 
@@ -13,25 +16,23 @@ test-support = []
 
 [dependencies]
 anyhow.workspace = true
-client = { path = "../client" }
-db = { path = "../db" }
-editor = { path = "../editor" }
-fs = { path = "../fs" }
-fuzzy = {  path = "../fuzzy" }
-gpui = { path = "../gpui" }
-install_cli = { path = "../install_cli" }
-log.workspace = true
-picker = { path = "../picker" }
-project = { path = "../project" }
+client.workspace = true
+inline_completion_button.workspace = true
+db.workspace = true
+extensions_ui.workspace = true
+fuzzy.workspace = true
+gpui.workspace = true
+install_cli.workspace = true
+picker.workspace = true
+project.workspace = true
 schemars.workspace = true
 serde.workspace = true
-settings = { path = "../settings" }
-theme = { path = "../theme" }
-theme_selector = { path = "../theme_selector" }
-ui = { path = "../ui" }
-util = { path = "../util" }
-vim = { path = "../vim" }
-workspace = { path = "../workspace" }
+settings.workspace = true
+theme_selector.workspace = true
+ui.workspace = true
+util.workspace = true
+vim.workspace = true
+workspace.workspace = true
 
 [dev-dependencies]
-editor = { path = "../editor", features = ["test-support"] }
+editor = { workspace = true, features = ["test-support"] }

@@ -5,10 +5,13 @@ edition = "2021"
 publish = false
 license = "GPL-3.0-or-later"
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/menu.rs"
 doctest = false
 
 [dependencies]
-gpui = { path = "../gpui" }
+gpui.workspace = true
 serde = { workspace = true }

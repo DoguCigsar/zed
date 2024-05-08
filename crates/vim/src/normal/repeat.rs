@@ -172,6 +172,13 @@ pub(crate) fn repeat(cx: &mut WindowContext, from_insert_mode: bool) {
             editor.show_local_selections = false;
         })?;
         for action in actions {
+            if !matches!(
+                cx.update(|cx| Vim::read(cx).workspace_state.replaying),
+                Ok(true)
+            ) {
+                break;
+            }
+
             match action {
                 ReplayableAction::Action(action) => {
                     if should_replay(&action) {
@@ -294,7 +301,7 @@ mod test {
                     lsp::CompletionItem {
                         label: "first".to_string(),
                         text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
-                            range: lsp::Range::new(position.clone(), position.clone()),
+                            range: lsp::Range::new(position, position),
                             new_text: "first".to_string(),
                         })),
                         ..Default::default()
@@ -302,7 +309,7 @@ mod test {
                     lsp::CompletionItem {
                         label: "second".to_string(),
                         text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
-                            range: lsp::Range::new(position.clone(), position.clone()),
+                            range: lsp::Range::new(position, position),
                             new_text: "second".to_string(),
                         })),
                         ..Default::default()

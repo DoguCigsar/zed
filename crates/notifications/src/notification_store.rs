@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use channel::{ChannelMessage, ChannelMessageId, ChannelStore};
-use client::{Client, UserStore};
+use client::{ChannelId, Client, UserStore};
 use collections::HashMap;
 use db::smol::stream::StreamExt;
 use gpui::{
@@ -114,6 +114,7 @@ impl NotificationStore {
             _subscriptions: vec![
                 client.add_message_handler(cx.weak_model(), Self::handle_new_notification),
                 client.add_message_handler(cx.weak_model(), Self::handle_delete_notification),
+                client.add_message_handler(cx.weak_model(), Self::handle_update_notification),
             ],
             user_store,
             client,
@@ -232,6 +233,40 @@ impl NotificationStore {
     ) -> Result<()> {
         this.update(&mut cx, |this, cx| {
             this.splice_notifications([(envelope.payload.notification_id, None)], false, cx);
+            Ok(())
+        })?
+    }
+
+    async fn handle_update_notification(
+        this: Model<Self>,
+        envelope: TypedEnvelope<proto::UpdateNotification>,
+        _: Arc<Client>,
+        mut cx: AsyncAppContext,
+    ) -> Result<()> {
+        this.update(&mut cx, |this, cx| {
+            if let Some(notification) = envelope.payload.notification {
+                if let Some(rpc::Notification::ChannelMessageMention {
+                    message_id,
+                    sender_id: _,
+                    channel_id: _,
+                }) = Notification::from_proto(&notification)
+                {
+                    let fetch_message_task = this.channel_store.update(cx, |this, cx| {
+                        this.fetch_channel_messages(vec![message_id], cx)
+                    });
+
+                    cx.spawn(|this, mut cx| async move {
+                        let messages = fetch_message_task.await?;
+                        this.update(&mut cx, move |this, cx| {
+                            for message in messages {
+                                this.channel_messages.insert(message_id, message);
+                            }
+                            cx.notify();
+                        })
+                    })
+                    .detach_and_log_err(cx)
+                }
+            }
             Ok(())
         })?
     }
@@ -413,7 +448,7 @@ impl NotificationStore {
             Notification::ChannelInvitation { channel_id, .. } => {
                 self.channel_store
                     .update(cx, |store, cx| {
-                        store.respond_to_channel_invite(channel_id, response, cx)
+                        store.respond_to_channel_invite(ChannelId(channel_id), response, cx)
                     })
                     .detach();
             }

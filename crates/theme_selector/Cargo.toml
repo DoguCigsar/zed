@@ -5,27 +5,26 @@ edition = "2021"
 publish = false
 license = "GPL-3.0-or-later"
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/theme_selector.rs"
 doctest = false
 
 [dependencies]
-client = { path = "../client" }
-editor = { path = "../editor" }
-feature_flags = { path = "../feature_flags" }
-fs = { path = "../fs" }
-fuzzy = {  path = "../fuzzy" }
-gpui = { path = "../gpui" }
+client.workspace = true
+feature_flags.workspace = true
+fs.workspace = true
+fuzzy.workspace = true
+gpui.workspace = true
 log.workspace = true
-parking_lot.workspace = true
-picker = { path = "../picker" }
-postage.workspace = true
-settings = { path = "../settings" }
-smol.workspace = true
-theme = { path = "../theme" }
-ui = { path = "../ui" }
-util = { path = "../util" }
-workspace = { path = "../workspace" }
+picker.workspace = true
+serde.workspace = true
+settings.workspace = true
+theme.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
 
 [dev-dependencies]
-editor = { path = "../editor", features = ["test-support"] }

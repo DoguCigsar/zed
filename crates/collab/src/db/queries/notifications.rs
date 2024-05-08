@@ -1,5 +1,6 @@
 use super::*;
 use rpc::Notification;
+use util::ResultExt;
 
 impl Database {
     /// Initializes the different kinds of notifications by upserting records for them.
@@ -53,11 +54,8 @@ impl Database {
                 .await?;
             while let Some(row) = rows.next().await {
                 let row = row?;
-                let kind = row.kind;
-                if let Some(proto) = model_to_proto(self, row) {
+                if let Some(proto) = model_to_proto(self, row).log_err() {
                     result.push(proto);
-                } else {
-                    log::warn!("unknown notification kind {:?}", kind);
                 }
             }
             result.reverse();
@@ -95,7 +93,7 @@ impl Database {
             content: ActiveValue::Set(proto.content.clone()),
             ..Default::default()
         }
-        .save(&*tx)
+        .save(tx)
         .await?;
 
         Ok(Some((
@@ -184,7 +182,7 @@ impl Database {
         tx: &DatabaseTransaction,
     ) -> Result<Option<(UserId, proto::Notification)>> {
         if let Some(id) = self
-            .find_notification(recipient_id, notification, &*tx)
+            .find_notification(recipient_id, notification, tx)
             .await?
         {
             let row = notification::Entity::update(notification::ActiveModel {
@@ -200,7 +198,9 @@ impl Database {
             })
             .exec(tx)
             .await?;
-            Ok(model_to_proto(self, row).map(|notification| (recipient_id, notification)))
+            Ok(model_to_proto(self, row)
+                .map(|notification| (recipient_id, notification))
+                .ok())
         } else {
             Ok(None)
         }
@@ -236,14 +236,17 @@ impl Database {
                     }),
             )
             .into_values::<_, QueryIds>()
-            .one(&*tx)
+            .one(tx)
             .await?)
     }
 }
 
-fn model_to_proto(this: &Database, row: notification::Model) -> Option<proto::Notification> {
-    let kind = this.notification_kinds_by_id.get(&row.kind)?;
-    Some(proto::Notification {
+pub fn model_to_proto(this: &Database, row: notification::Model) -> Result<proto::Notification> {
+    let kind = this
+        .notification_kinds_by_id
+        .get(&row.kind)
+        .ok_or_else(|| anyhow!("Unknown notification kind"))?;
+    Ok(proto::Notification {
         id: row.id.to_proto(),
         kind: kind.to_string(),
         timestamp: row.created_at.assume_utc().unix_timestamp() as u64,

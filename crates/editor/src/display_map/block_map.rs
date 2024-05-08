@@ -2,10 +2,11 @@ use super::{
     wrap_map::{self, WrapEdit, WrapPoint, WrapSnapshot},
     Highlights,
 };
-use crate::{Anchor, Editor, EditorStyle, ExcerptId, ExcerptRange, ToPoint as _};
+use crate::{EditorStyle, GutterDimensions};
 use collections::{Bound, HashMap, HashSet};
-use gpui::{AnyElement, ElementContext, Pixels, View};
+use gpui::{AnyElement, Pixels, WindowContext};
 use language::{BufferSnapshot, Chunk, Patch, Point};
+use multi_buffer::{Anchor, ExcerptId, ExcerptRange, ToPoint as _};
 use parking_lot::Mutex;
 use std::{
     cell::RefCell,
@@ -22,6 +23,9 @@ use text::Edit;
 
 const NEWLINES: &[u8] = &[b'\n'; u8::MAX as usize];
 
+/// Tracks custom blocks such as diagnostics that should be displayed within buffer.
+///
+/// See the [`display_map` module documentation](crate::display_map) for more information.
 pub struct BlockMap {
     next_block_id: AtomicUsize,
     wrap_snapshot: RefCell<WrapSnapshot>,
@@ -33,6 +37,7 @@ pub struct BlockMap {
 
 pub struct BlockMapWriter<'a>(&'a mut BlockMap);
 
+#[derive(Clone)]
 pub struct BlockSnapshot {
     wrap_snapshot: WrapSnapshot,
     transforms: SumTree<Transform>,
@@ -50,7 +55,7 @@ struct BlockRow(u32);
 #[derive(Copy, Clone, Debug, Default, Eq, Ord, PartialOrd, PartialEq)]
 struct WrapRow(u32);
 
-pub type RenderBlock = Arc<dyn Fn(&mut BlockContext) -> AnyElement>;
+pub type RenderBlock = Box<dyn Send + Fn(&mut BlockContext) -> AnyElement>;
 
 pub struct Block {
     id: BlockId,
@@ -61,15 +66,11 @@ pub struct Block {
     disposition: BlockDisposition,
 }
 
-#[derive(Clone)]
-pub struct BlockProperties<P>
-where
-    P: Clone,
-{
+pub struct BlockProperties<P> {
     pub position: P,
     pub height: u8,
     pub style: BlockStyle,
-    pub render: Arc<dyn Fn(&mut BlockContext) -> AnyElement>,
+    pub render: Box<dyn Send + Fn(&mut BlockContext) -> AnyElement>,
     pub disposition: BlockDisposition,
 }
 
@@ -81,12 +82,10 @@ pub enum BlockStyle {
 }
 
 pub struct BlockContext<'a, 'b> {
-    pub context: &'b mut ElementContext<'a>,
-    pub view: View<Editor>,
+    pub context: &'b mut WindowContext<'a>,
     pub anchor_x: Pixels,
     pub max_width: Pixels,
-    pub gutter_width: Pixels,
-    pub gutter_padding: Pixels,
+    pub gutter_dimensions: &'b GutterDimensions,
     pub em_width: Pixels,
     pub line_height: Pixels,
     pub block_id: usize,
@@ -365,28 +364,33 @@ impl BlockMap {
                         (position.row(), TransformBlock::Custom(block.clone()))
                     }),
             );
-            blocks_in_edit.extend(
-                buffer
-                    .excerpt_boundaries_in_range((start_bound, end_bound))
-                    .map(|excerpt_boundary| {
-                        (
-                            wrap_snapshot
-                                .make_wrap_point(Point::new(excerpt_boundary.row, 0), Bias::Left)
-                                .row(),
-                            TransformBlock::ExcerptHeader {
-                                id: excerpt_boundary.id,
-                                buffer: excerpt_boundary.buffer,
-                                range: excerpt_boundary.range,
-                                height: if excerpt_boundary.starts_new_buffer {
-                                    self.buffer_header_height
-                                } else {
-                                    self.excerpt_header_height
+            if buffer.show_headers() {
+                blocks_in_edit.extend(
+                    buffer
+                        .excerpt_boundaries_in_range((start_bound, end_bound))
+                        .map(|excerpt_boundary| {
+                            (
+                                wrap_snapshot
+                                    .make_wrap_point(
+                                        Point::new(excerpt_boundary.row, 0),
+                                        Bias::Left,
+                                    )
+                                    .row(),
+                                TransformBlock::ExcerptHeader {
+                                    id: excerpt_boundary.id,
+                                    buffer: excerpt_boundary.buffer,
+                                    range: excerpt_boundary.range,
+                                    height: if excerpt_boundary.starts_new_buffer {
+                                        self.buffer_header_height
+                                    } else {
+                                        self.excerpt_header_height
+                                    },
+                                    starts_new_buffer: excerpt_boundary.starts_new_buffer,
                                 },
-                                starts_new_buffer: excerpt_boundary.starts_new_buffer,
-                            },
-                        )
-                    }),
-            );
+                            )
+                        }),
+                );
+            }
 
             // Place excerpt headers above custom blocks on the same row.
             blocks_in_edit.sort_unstable_by(|(row_a, block_a), (row_b, block_b)| {
@@ -935,7 +939,7 @@ impl BlockDisposition {
 }
 
 impl<'a> Deref for BlockContext<'a, '_> {
-    type Target = ElementContext<'a>;
+    type Target = WindowContext<'a>;
 
     fn deref(&self) -> &Self::Target {
         self.context
@@ -985,7 +989,7 @@ fn offset_for_row(s: &str, target: u32) -> (u32, usize) {
         if row >= target {
             break;
         }
-        offset += line.len() as usize;
+        offset += line.len();
     }
     (row, offset)
 }
@@ -1039,21 +1043,21 @@ mod tests {
                 position: buffer_snapshot.anchor_after(Point::new(1, 0)),
                 height: 1,
                 disposition: BlockDisposition::Above,
-                render: Arc::new(|_| div().into_any()),
+                render: Box::new(|_| div().into_any()),
             },
             BlockProperties {
                 style: BlockStyle::Fixed,
                 position: buffer_snapshot.anchor_after(Point::new(1, 2)),
                 height: 2,
                 disposition: BlockDisposition::Above,
-                render: Arc::new(|_| div().into_any()),
+                render: Box::new(|_| div().into_any()),
             },
             BlockProperties {
                 style: BlockStyle::Fixed,
                 position: buffer_snapshot.anchor_after(Point::new(3, 3)),
                 height: 3,
                 disposition: BlockDisposition::Below,
-                render: Arc::new(|_| div().into_any()),
+                render: Box::new(|_| div().into_any()),
             },
         ]);
 
@@ -1207,14 +1211,14 @@ mod tests {
                 style: BlockStyle::Fixed,
                 position: buffer_snapshot.anchor_after(Point::new(1, 12)),
                 disposition: BlockDisposition::Above,
-                render: Arc::new(|_| div().into_any()),
+                render: Box::new(|_| div().into_any()),
                 height: 1,
             },
             BlockProperties {
                 style: BlockStyle::Fixed,
                 position: buffer_snapshot.anchor_after(Point::new(1, 1)),
                 disposition: BlockDisposition::Below,
-                render: Arc::new(|_| div().into_any()),
+                render: Box::new(|_| div().into_any()),
                 height: 1,
             },
         ]);
@@ -1309,7 +1313,7 @@ mod tests {
                                 position,
                                 height,
                                 disposition,
-                                render: Arc::new(|_| div().into_any()),
+                                render: Box::new(|_| div().into_any()),
                             }
                         })
                         .collect::<Vec<_>>();
@@ -1323,7 +1327,14 @@ mod tests {
                         wrap_map.sync(tab_snapshot, tab_edits, cx)
                     });
                     let mut block_map = block_map.write(wraps_snapshot, wrap_edits);
-                    let block_ids = block_map.insert(block_properties.clone());
+                    let block_ids =
+                        block_map.insert(block_properties.iter().map(|props| BlockProperties {
+                            position: props.position,
+                            height: props.height,
+                            style: props.style,
+                            render: Box::new(|_| div().into_any()),
+                            disposition: props.disposition,
+                        }));
                     for (block_id, props) in block_ids.into_iter().zip(block_properties) {
                         custom_blocks.push((block_id, props));
                     }

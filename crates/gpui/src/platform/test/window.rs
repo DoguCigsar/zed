@@ -1,7 +1,8 @@
 use crate::{
-    px, AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, KeyDownEvent, Keystroke,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, Size, TestPlatform, TileId, WindowAppearance, WindowBounds, WindowOptions,
+    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
+    DispatchEventResult, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, Size, TestPlatform, TileId, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowParams,
 };
 use collections::HashMap;
 use parking_lot::Mutex;
@@ -12,7 +13,7 @@ use std::{
 };
 
 pub(crate) struct TestWindowState {
-    pub(crate) bounds: WindowBounds,
+    pub(crate) bounds: Bounds<DevicePixels>,
     pub(crate) handle: AnyWindowHandle,
     display: Rc<dyn PlatformDisplay>,
     pub(crate) title: Option<String>,
@@ -20,11 +21,12 @@ pub(crate) struct TestWindowState {
     platform: Weak<TestPlatform>,
     sprite_atlas: Arc<dyn PlatformAtlas>,
     pub(crate) should_close_handler: Option<Box<dyn FnMut() -> bool>>,
-    input_callback: Option<Box<dyn FnMut(PlatformInput) -> bool>>,
+    input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     active_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
+    is_fullscreen: bool,
 }
 
 #[derive(Clone)]
@@ -48,13 +50,13 @@ impl HasDisplayHandle for TestWindow {
 
 impl TestWindow {
     pub fn new(
-        options: WindowOptions,
         handle: AnyWindowHandle,
+        params: WindowParams,
         platform: Weak<TestPlatform>,
         display: Rc<dyn PlatformDisplay>,
     ) -> Self {
         Self(Arc::new(Mutex::new(TestWindowState {
-            bounds: options.bounds,
+            bounds: params.bounds,
             display,
             platform,
             handle,
@@ -67,6 +69,7 @@ impl TestWindow {
             resize_callback: None,
             moved_callback: None,
             input_handler: None,
+            is_fullscreen: false,
         })))
     }
 
@@ -76,17 +79,7 @@ impl TestWindow {
         let Some(mut callback) = lock.resize_callback.take() else {
             return;
         };
-        match &mut lock.bounds {
-            WindowBounds::Fullscreen | WindowBounds::Maximized => {
-                lock.bounds = WindowBounds::Fixed(Bounds {
-                    origin: Point::default(),
-                    size: size.map(|pixels| f64::from(pixels).into()),
-                });
-            }
-            WindowBounds::Fixed(bounds) => {
-                bounds.size = size.map(|pixels| f64::from(pixels).into());
-            }
-        }
+        lock.bounds.size = size.map(|pixels| (pixels.0 as i32).into());
         drop(lock);
         callback(size, scale_factor);
         self.0.lock().resize_callback = Some(callback);
@@ -110,64 +103,29 @@ impl TestWindow {
         drop(lock);
         let result = callback(event);
         self.0.lock().input_callback = Some(callback);
-        result
-    }
-
-    pub fn simulate_keystroke(&mut self, mut keystroke: Keystroke, is_held: bool) {
-        if keystroke.ime_key.is_none()
-            && !keystroke.modifiers.command
-            && !keystroke.modifiers.control
-            && !keystroke.modifiers.function
-        {
-            keystroke.ime_key = Some(if keystroke.modifiers.shift {
-                keystroke.key.to_ascii_uppercase().clone()
-            } else {
-                keystroke.key.clone()
-            })
-        }
-
-        if self.simulate_input(PlatformInput::KeyDown(KeyDownEvent {
-            keystroke: keystroke.clone(),
-            is_held,
-        })) {
-            return;
-        }
-
-        let mut lock = self.0.lock();
-        let Some(mut input_handler) = lock.input_handler.take() else {
-            panic!(
-                "simulate_keystroke {:?} input event was not handled and there was no active input",
-                &keystroke
-            );
-        };
-        drop(lock);
-        if let Some(text) = keystroke.ime_key.as_ref() {
-            input_handler.replace_text_in_range(None, &text);
-        }
-
-        self.0.lock().input_handler = Some(input_handler);
+        !result.propagate
     }
 }
 
 impl PlatformWindow for TestWindow {
-    fn bounds(&self) -> WindowBounds {
+    fn bounds(&self) -> Bounds<DevicePixels> {
         self.0.lock().bounds
     }
 
+    fn window_bounds(&self) -> WindowBounds {
+        WindowBounds::Windowed(self.bounds())
+    }
+
+    fn is_maximized(&self) -> bool {
+        false
+    }
+
     fn content_size(&self) -> Size<Pixels> {
-        let bounds = match self.bounds() {
-            WindowBounds::Fixed(bounds) => bounds,
-            WindowBounds::Maximized | WindowBounds::Fullscreen => self.display().bounds(),
-        };
-        bounds.size.map(|p| px(p.0))
+        self.bounds().size.into()
     }
 
     fn scale_factor(&self) -> f32 {
         2.0
-    }
-
-    fn titlebar_height(&self) -> Pixels {
-        unimplemented!()
     }
 
     fn appearance(&self) -> WindowAppearance {
@@ -186,10 +144,6 @@ impl PlatformWindow for TestWindow {
         crate::Modifiers::default()
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         self.0.lock().input_handler = Some(input_handler);
     }
@@ -201,16 +155,18 @@ impl PlatformWindow for TestWindow {
     fn prompt(
         &self,
         _level: crate::PromptLevel,
-        _msg: &str,
-        _detail: Option<&str>,
+        msg: &str,
+        detail: Option<&str>,
         _answers: &[&str],
-    ) -> futures::channel::oneshot::Receiver<usize> {
-        self.0
-            .lock()
-            .platform
-            .upgrade()
-            .expect("platform dropped")
-            .prompt()
+    ) -> Option<futures::channel::oneshot::Receiver<usize>> {
+        Some(
+            self.0
+                .lock()
+                .platform
+                .upgrade()
+                .expect("platform dropped")
+                .prompt(msg, detail),
+        )
     }
 
     fn activate(&self) {
@@ -222,8 +178,18 @@ impl PlatformWindow for TestWindow {
             .set_active_window(Some(self.clone()))
     }
 
+    fn is_active(&self) -> bool {
+        false
+    }
+
     fn set_title(&mut self, title: &str) {
         self.0.lock().title = Some(title.to_owned());
+    }
+
+    fn set_app_id(&mut self, _app_id: &str) {}
+
+    fn set_background_appearance(&mut self, _background: WindowBackgroundAppearance) {
+        unimplemented!()
     }
 
     fn set_edited(&mut self, edited: bool) {
@@ -242,13 +208,18 @@ impl PlatformWindow for TestWindow {
         unimplemented!()
     }
 
-    fn toggle_full_screen(&self) {
-        unimplemented!()
+    fn toggle_fullscreen(&self) {
+        let mut lock = self.0.lock();
+        lock.is_fullscreen = !lock.is_fullscreen;
+    }
+
+    fn is_fullscreen(&self) -> bool {
+        self.0.lock().is_fullscreen
     }
 
     fn on_request_frame(&self, _callback: Box<dyn FnMut()>) {}
 
-    fn on_input(&self, callback: Box<dyn FnMut(crate::PlatformInput) -> bool>) {
+    fn on_input(&self, callback: Box<dyn FnMut(crate::PlatformInput) -> DispatchEventResult>) {
         self.0.lock().input_callback = Some(callback)
     }
 
@@ -260,10 +231,6 @@ impl PlatformWindow for TestWindow {
         self.0.lock().resize_callback = Some(callback)
     }
 
-    fn on_fullscreen(&self, _callback: Box<dyn FnMut(bool)>) {
-        unimplemented!()
-    }
-
     fn on_moved(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().moved_callback = Some(callback)
     }
@@ -272,15 +239,9 @@ impl PlatformWindow for TestWindow {
         self.0.lock().should_close_handler = Some(callback);
     }
 
-    fn on_close(&self, _callback: Box<dyn FnOnce()>) {
-        unimplemented!()
-    }
+    fn on_close(&self, _callback: Box<dyn FnOnce()>) {}
 
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
-
-    fn is_topmost_for_position(&self, _position: crate::Point<Pixels>) -> bool {
-        unimplemented!()
-    }
 
     fn draw(&self, _scene: &crate::Scene) {}
 
@@ -290,6 +251,11 @@ impl PlatformWindow for TestWindow {
 
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         Some(self)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND {
+        unimplemented!()
     }
 }
 
@@ -340,6 +306,7 @@ impl PlatformAtlas for TestAtlas {
                     kind: crate::AtlasTextureKind::Path,
                 },
                 tile_id: TileId(tile_id),
+                padding: 0,
                 bounds: crate::Bounds {
                     origin: Point::default(),
                     size,

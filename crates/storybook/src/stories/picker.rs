@@ -41,7 +41,7 @@ impl PickerDelegate for Delegate {
         self.candidates.len()
     }
 
-    fn placeholder_text(&self) -> Arc<str> {
+    fn placeholder_text(&self, _cx: &mut WindowContext) -> Arc<str> {
         "Test".into()
     }
 
@@ -129,7 +129,7 @@ impl PickerStory {
                 KeyBinding::new("cmd-up", menu::SelectFirst, Some("picker")),
                 KeyBinding::new("cmd-down", menu::SelectLast, Some("picker")),
                 KeyBinding::new("enter", menu::Confirm, Some("picker")),
-                KeyBinding::new("ctrl-enter", menu::ShowContextMenu, Some("picker")),
+                KeyBinding::new("ctrl-enter", menu::SecondaryConfirm, Some("picker")),
                 KeyBinding::new("cmd-enter", menu::SecondaryConfirm, Some("picker")),
                 KeyBinding::new("escape", menu::Cancel, Some("picker")),
                 KeyBinding::new("ctrl-c", menu::Cancel, Some("picker")),
@@ -190,7 +190,7 @@ impl PickerStory {
                     ]);
                     delegate.update_matches("".into(), cx).detach();
 
-                    let picker = Picker::new(delegate, cx);
+                    let picker = Picker::uniform_list(delegate, cx);
                     picker.focus(cx);
                     picker
                 }),

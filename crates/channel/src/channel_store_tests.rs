@@ -2,6 +2,7 @@ use crate::channel_chat::ChannelChatEvent;
 
 use super::*;
 use client::{test::FakeServer, Client, UserStore};
+use clock::FakeSystemClock;
 use gpui::{AppContext, Context, Model, TestAppContext};
 use rpc::proto::{self};
 use settings::SettingsStore;
@@ -184,6 +185,8 @@ async fn test_channel_messages(cx: &mut TestAppContext) {
                     sender_id: 5,
                     mentions: vec![],
                     nonce: Some(1.into()),
+                    reply_to_message_id: None,
+                    edited_at: None,
                 },
                 proto::ChannelMessage {
                     id: 11,
@@ -192,6 +195,8 @@ async fn test_channel_messages(cx: &mut TestAppContext) {
                     sender_id: 6,
                     mentions: vec![],
                     nonce: Some(2.into()),
+                    reply_to_message_id: None,
+                    edited_at: None,
                 },
             ],
             done: false,
@@ -239,6 +244,8 @@ async fn test_channel_messages(cx: &mut TestAppContext) {
             sender_id: 7,
             mentions: vec![],
             nonce: Some(3.into()),
+            reply_to_message_id: None,
+            edited_at: None,
         }),
     });
 
@@ -257,7 +264,7 @@ async fn test_channel_messages(cx: &mut TestAppContext) {
     );
 
     assert_eq!(
-        channel.next_event(cx),
+        channel.next_event(cx).await,
         ChannelChatEvent::MessagesUpdated {
             old_range: 2..2,
             new_count: 1,
@@ -292,6 +299,8 @@ async fn test_channel_messages(cx: &mut TestAppContext) {
                     sender_id: 5,
                     nonce: Some(4.into()),
                     mentions: vec![],
+                    reply_to_message_id: None,
+                    edited_at: None,
                 },
                 proto::ChannelMessage {
                     id: 9,
@@ -300,13 +309,15 @@ async fn test_channel_messages(cx: &mut TestAppContext) {
                     sender_id: 6,
                     nonce: Some(5.into()),
                     mentions: vec![],
+                    reply_to_message_id: None,
+                    edited_at: None,
                 },
             ],
         },
     );
 
     assert_eq!(
-        channel.next_event(cx),
+        channel.next_event(cx).await,
         ChannelChatEvent::MessagesUpdated {
             old_range: 0..0,
             new_count: 2,
@@ -332,8 +343,9 @@ fn init_test(cx: &mut AppContext) -> Model<ChannelStore> {
     release_channel::init("0.0.0", cx);
     client::init_settings(cx);
 
+    let clock = Arc::new(FakeSystemClock::default());
     let http = FakeHttpClient::with_404_response();
-    let client = Client::new(http.clone(), cx);
+    let client = Client::new(clock, http.clone(), cx);
     let user_store = cx.new_model(|cx| UserStore::new(client.clone(), cx));
 
     client::init(&client, cx);

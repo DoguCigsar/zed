@@ -11,34 +11,41 @@ use client::{
     proto::{self, PeerId},
     Client,
 };
+use futures::{channel::mpsc, StreamExt};
 use gpui::{
     AnyElement, AnyView, AppContext, Entity, EntityId, EventEmitter, FocusHandle, FocusableView,
-    HighlightStyle, Model, Pixels, Point, SharedString, Task, View, ViewContext, WeakView,
+    Font, HighlightStyle, Model, Pixels, Point, SharedString, Task, View, ViewContext, WeakView,
     WindowContext,
 };
 use project::{Project, ProjectEntryId, ProjectPath};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::Settings;
+use settings::{Settings, SettingsSources};
 use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
     ops::Range,
-    path::PathBuf,
     rc::Rc,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
 use theme::Theme;
+use ui::Element as _;
+
+pub const LEADER_UPDATE_THROTTLE: Duration = Duration::from_millis(200);
 
 #[derive(Deserialize)]
 pub struct ItemSettings {
     pub git_status: bool,
     pub close_position: ClosePosition,
+}
+
+#[derive(Deserialize)]
+pub struct PreviewTabsSettings {
+    pub enabled: bool,
+    pub enable_preview_from_file_finder: bool,
+    pub enable_preview_from_code_navigation: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -62,7 +69,7 @@ impl ClosePosition {
 pub struct ItemSettingsContent {
     /// Whether to show the Git file status on a tab item.
     ///
-    /// Default: true
+    /// Default: false
     git_status: Option<bool>,
     /// Position of the close button in a tab.
     ///
@@ -70,17 +77,40 @@ pub struct ItemSettingsContent {
     close_position: Option<ClosePosition>,
 }
 
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PreviewTabsSettingsContent {
+    /// Whether to show opened editors as preview tabs.
+    /// Preview tabs do not stay open, are reused until explicitly set to be kept open opened (via double-click or editing) and show file names in italic.
+    ///
+    /// Default: true
+    enabled: Option<bool>,
+    /// Whether to open tabs in preview mode when selected from the file finder.
+    ///
+    /// Default: false
+    enable_preview_from_file_finder: Option<bool>,
+    /// Whether a preview tab gets replaced when code navigation is used to navigate away from the tab.
+    ///
+    /// Default: false
+    enable_preview_from_code_navigation: Option<bool>,
+}
+
 impl Settings for ItemSettings {
     const KEY: Option<&'static str> = Some("tabs");
 
     type FileContent = ItemSettingsContent;
 
-    fn load(
-        default_value: &Self::FileContent,
-        user_values: &[&Self::FileContent],
-        _: &mut AppContext,
-    ) -> Result<Self> {
-        Self::load_via_json_merge(default_value, user_values)
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut AppContext) -> Result<Self> {
+        sources.json_merge()
+    }
+}
+
+impl Settings for PreviewTabsSettings {
+    const KEY: Option<&'static str> = Some("preview_tabs");
+
+    type FileContent = PreviewTabsSettingsContent;
+
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut AppContext) -> Result<Self> {
+        sources.json_merge()
     }
 }
 
@@ -96,10 +126,22 @@ pub enum ItemEvent {
 pub struct BreadcrumbText {
     pub text: String,
     pub highlights: Option<Vec<(Range<usize>, HighlightStyle)>>,
+    pub font: Option<Font>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TabContentParams {
+    pub detail: Option<usize>,
+    pub selected: bool,
+    pub preview: bool,
 }
 
 pub trait Item: FocusableView + EventEmitter<Self::Event> {
     type Event;
+    fn tab_content(&self, _params: TabContentParams, _cx: &WindowContext) -> AnyElement {
+        gpui::Empty.into_any()
+    }
+    fn to_item_events(_event: &Self::Event, _f: impl FnMut(ItemEvent)) {}
 
     fn deactivated(&mut self, _: &mut ViewContext<Self>) {}
     fn workspace_deactivated(&mut self, _: &mut ViewContext<Self>) {}
@@ -112,9 +154,10 @@ pub trait Item: FocusableView + EventEmitter<Self::Event> {
     fn tab_description(&self, _: usize, _: &AppContext) -> Option<SharedString> {
         None
     }
-    fn tab_content(&self, detail: Option<usize>, selected: bool, cx: &WindowContext) -> AnyElement;
 
-    fn telemetry_event_text(&self) -> Option<&'static str>;
+    fn telemetry_event_text(&self) -> Option<&'static str> {
+        None
+    }
 
     /// (model id, Item)
     fn for_each_project_item(
@@ -146,13 +189,18 @@ pub trait Item: FocusableView + EventEmitter<Self::Event> {
     fn can_save(&self, _cx: &AppContext) -> bool {
         false
     }
-    fn save(&mut self, _project: Model<Project>, _cx: &mut ViewContext<Self>) -> Task<Result<()>> {
+    fn save(
+        &mut self,
+        _format: bool,
+        _project: Model<Project>,
+        _cx: &mut ViewContext<Self>,
+    ) -> Task<Result<()>> {
         unimplemented!("save() must be implemented if can_save() returns true")
     }
     fn save_as(
         &mut self,
         _project: Model<Project>,
-        _abs_path: PathBuf,
+        _path: ProjectPath,
         _cx: &mut ViewContext<Self>,
     ) -> Task<Result<()>> {
         unimplemented!("save_as() must be implemented if can_save() returns true")
@@ -164,8 +212,6 @@ pub trait Item: FocusableView + EventEmitter<Self::Event> {
     ) -> Task<Result<()>> {
         unimplemented!("reload() must be implemented if can_save() returns true")
     }
-
-    fn to_item_events(event: &Self::Event, f: impl FnMut(ItemEvent));
 
     fn act_as_type<'a>(
         &'a self,
@@ -226,9 +272,9 @@ pub trait ItemHandle: 'static + Send {
     fn focus_handle(&self, cx: &WindowContext) -> FocusHandle;
     fn tab_tooltip_text(&self, cx: &AppContext) -> Option<SharedString>;
     fn tab_description(&self, detail: usize, cx: &AppContext) -> Option<SharedString>;
-    fn tab_content(&self, detail: Option<usize>, selected: bool, cx: &WindowContext) -> AnyElement;
+    fn tab_content(&self, params: TabContentParams, cx: &WindowContext) -> AnyElement;
     fn telemetry_event_text(&self, cx: &WindowContext) -> Option<&'static str>;
-    fn dragged_tab_content(&self, detail: Option<usize>, cx: &WindowContext) -> AnyElement;
+    fn dragged_tab_content(&self, params: TabContentParams, cx: &WindowContext) -> AnyElement;
     fn project_path(&self, cx: &AppContext) -> Option<ProjectPath>;
     fn project_entry_ids(&self, cx: &AppContext) -> SmallVec<[ProjectEntryId; 3]>;
     fn project_item_model_ids(&self, cx: &AppContext) -> SmallVec<[EntityId; 3]>;
@@ -258,11 +304,16 @@ pub trait ItemHandle: 'static + Send {
     fn is_dirty(&self, cx: &AppContext) -> bool;
     fn has_conflict(&self, cx: &AppContext) -> bool;
     fn can_save(&self, cx: &AppContext) -> bool;
-    fn save(&self, project: Model<Project>, cx: &mut WindowContext) -> Task<Result<()>>;
+    fn save(
+        &self,
+        format: bool,
+        project: Model<Project>,
+        cx: &mut WindowContext,
+    ) -> Task<Result<()>>;
     fn save_as(
         &self,
         project: Model<Project>,
-        abs_path: PathBuf,
+        path: ProjectPath,
         cx: &mut WindowContext,
     ) -> Task<Result<()>>;
     fn reload(&self, project: Model<Project>, cx: &mut WindowContext) -> Task<Result<()>>;
@@ -324,12 +375,18 @@ impl<T: Item> ItemHandle for View<T> {
         self.read(cx).tab_description(detail, cx)
     }
 
-    fn tab_content(&self, detail: Option<usize>, selected: bool, cx: &WindowContext) -> AnyElement {
-        self.read(cx).tab_content(detail, selected, cx)
+    fn tab_content(&self, params: TabContentParams, cx: &WindowContext) -> AnyElement {
+        self.read(cx).tab_content(params, cx)
     }
 
-    fn dragged_tab_content(&self, detail: Option<usize>, cx: &WindowContext) -> AnyElement {
-        self.read(cx).tab_content(detail, true, cx)
+    fn dragged_tab_content(&self, params: TabContentParams, cx: &WindowContext) -> AnyElement {
+        self.read(cx).tab_content(
+            TabContentParams {
+                selected: true,
+                ..params
+            },
+            cx,
+        )
     }
 
     fn project_path(&self, cx: &AppContext) -> Option<ProjectPath> {
@@ -405,7 +462,7 @@ impl<T: Item> ItemHandle for View<T> {
                     followed_item.is_project_item(cx),
                     proto::update_followers::Variant::CreateView(proto::View {
                         id: followed_item
-                            .remote_id(&workspace.app_state.client, cx)
+                            .remote_id(&workspace.client(), cx)
                             .map(|id| id.to_proto()),
                         variant: Some(message),
                         leader_id: workspace.leader_for_pane(&pane),
@@ -421,11 +478,48 @@ impl<T: Item> ItemHandle for View<T> {
             .is_none()
         {
             let mut pending_autosave = DelayedDebouncedEditAction::new();
+            let (pending_update_tx, mut pending_update_rx) = mpsc::unbounded();
             let pending_update = Rc::new(RefCell::new(None));
-            let pending_update_scheduled = Arc::new(AtomicBool::new(false));
 
-            let mut event_subscription =
-                Some(cx.subscribe(self, move |workspace, item, event, cx| {
+            let mut send_follower_updates = None;
+            if let Some(item) = self.to_followable_item_handle(cx) {
+                let is_project_item = item.is_project_item(cx);
+                let item = item.downgrade();
+
+                send_follower_updates = Some(cx.spawn({
+                    let pending_update = pending_update.clone();
+                    |workspace, mut cx| async move {
+                        while let Some(mut leader_id) = pending_update_rx.next().await {
+                            while let Ok(Some(id)) = pending_update_rx.try_next() {
+                                leader_id = id;
+                            }
+
+                            workspace.update(&mut cx, |workspace, cx| {
+                                let Some(item) = item.upgrade() else { return };
+                                workspace.update_followers(
+                                    is_project_item,
+                                    proto::update_followers::Variant::UpdateView(
+                                        proto::UpdateView {
+                                            id: item
+                                                .remote_id(workspace.client(), cx)
+                                                .map(|id| id.to_proto()),
+                                            variant: pending_update.borrow_mut().take(),
+                                            leader_id,
+                                        },
+                                    ),
+                                    cx,
+                                );
+                            })?;
+                            cx.background_executor().timer(LEADER_UPDATE_THROTTLE).await;
+                        }
+                        anyhow::Ok(())
+                    }
+                }));
+            }
+
+            let mut event_subscription = Some(cx.subscribe(
+                self,
+                move |workspace, item: View<T>, event, cx| {
                     let pane = if let Some(pane) = workspace
                         .panes_by_item
                         .get(&item.item_id())
@@ -438,9 +532,7 @@ impl<T: Item> ItemHandle for View<T> {
                     };
 
                     if let Some(item) = item.to_followable_item_handle(cx) {
-                        let is_project_item = item.is_project_item(cx);
                         let leader_id = workspace.leader_for_pane(&pane);
-
                         let follow_event = item.to_follow_event(event);
                         if leader_id.is_some()
                             && matches!(follow_event, Some(FollowEvent::Unfollow))
@@ -448,35 +540,13 @@ impl<T: Item> ItemHandle for View<T> {
                             workspace.unfollow(&pane, cx);
                         }
 
-                        if item.focus_handle(cx).contains_focused(cx)
-                            && item.add_event_to_update_proto(
+                        if item.focus_handle(cx).contains_focused(cx) {
+                            item.add_event_to_update_proto(
                                 event,
-                                &mut *pending_update.borrow_mut(),
+                                &mut pending_update.borrow_mut(),
                                 cx,
-                            )
-                            && !pending_update_scheduled.load(Ordering::SeqCst)
-                        {
-                            pending_update_scheduled.store(true, Ordering::SeqCst);
-                            cx.defer({
-                                let pending_update = pending_update.clone();
-                                let pending_update_scheduled = pending_update_scheduled.clone();
-                                move |this, cx| {
-                                    pending_update_scheduled.store(false, Ordering::SeqCst);
-                                    this.update_followers(
-                                        is_project_item,
-                                        proto::update_followers::Variant::UpdateView(
-                                            proto::UpdateView {
-                                                id: item
-                                                    .remote_id(&this.app_state.client, cx)
-                                                    .map(|id| id.to_proto()),
-                                                variant: pending_update.borrow_mut().take(),
-                                                leader_id,
-                                            },
-                                        ),
-                                        cx,
-                                    );
-                                }
-                            });
+                            );
+                            pending_update_tx.unbounded_send(leader_id).ok();
                         }
                     }
 
@@ -505,11 +575,13 @@ impl<T: Item> ItemHandle for View<T> {
                                     Pane::autosave_item(&item, workspace.project().clone(), cx)
                                 });
                             }
+                            pane.update(cx, |pane, cx| pane.handle_item_edit(item.item_id(), cx));
                         }
 
                         _ => {}
                     });
-                }));
+                },
+            ));
 
             cx.on_blur(&self.focus_handle(cx), move |workspace, cx| {
                 if WorkspaceSettings::get_global(cx).autosave == AutosaveSetting::OnFocusChange {
@@ -525,6 +597,7 @@ impl<T: Item> ItemHandle for View<T> {
             cx.observe_release(self, move |workspace, _, _| {
                 workspace.panes_by_item.remove(&item_id);
                 event_subscription.take();
+                send_follower_updates.take();
             })
             .detach();
         }
@@ -566,17 +639,22 @@ impl<T: Item> ItemHandle for View<T> {
         self.read(cx).can_save(cx)
     }
 
-    fn save(&self, project: Model<Project>, cx: &mut WindowContext) -> Task<Result<()>> {
-        self.update(cx, |item, cx| item.save(project, cx))
+    fn save(
+        &self,
+        format: bool,
+        project: Model<Project>,
+        cx: &mut WindowContext,
+    ) -> Task<Result<()>> {
+        self.update(cx, |item, cx| item.save(format, project, cx))
     }
 
     fn save_as(
         &self,
         project: Model<Project>,
-        abs_path: PathBuf,
+        path: ProjectPath,
         cx: &mut WindowContext,
     ) -> Task<anyhow::Result<()>> {
-        self.update(cx, |item, cx| item.save_as(project, abs_path, cx))
+        self.update(cx, |item, cx| item.save_as(project, path, cx))
     }
 
     fn reload(&self, project: Model<Project>, cx: &mut WindowContext) -> Task<Result<()>> {
@@ -700,6 +778,7 @@ pub trait FollowableItem: Item {
 
 pub trait FollowableItemHandle: ItemHandle {
     fn remote_id(&self, client: &Arc<Client>, cx: &WindowContext) -> Option<ViewId>;
+    fn downgrade(&self) -> Box<dyn WeakFollowableItemHandle>;
     fn set_leader_peer_id(&self, leader_peer_id: Option<PeerId>, cx: &mut WindowContext);
     fn to_state_proto(&self, cx: &WindowContext) -> Option<proto::view::Variant>;
     fn add_event_to_update_proto(
@@ -726,6 +805,10 @@ impl<T: FollowableItem> FollowableItemHandle for View<T> {
                 id: self.item_id().as_u64(),
             })
         })
+    }
+
+    fn downgrade(&self) -> Box<dyn WeakFollowableItemHandle> {
+        Box::new(self.downgrade())
     }
 
     fn set_leader_peer_id(&self, leader_peer_id: Option<PeerId>, cx: &mut WindowContext) {
@@ -767,9 +850,19 @@ impl<T: FollowableItem> FollowableItemHandle for View<T> {
     }
 }
 
+pub trait WeakFollowableItemHandle: Send + Sync {
+    fn upgrade(&self) -> Option<Box<dyn FollowableItemHandle>>;
+}
+
+impl<T: FollowableItem> WeakFollowableItemHandle for WeakView<T> {
+    fn upgrade(&self) -> Option<Box<dyn FollowableItemHandle>> {
+        Some(Box::new(self.upgrade()?))
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod test {
-    use super::{Item, ItemEvent};
+    use super::{Item, ItemEvent, TabContentParams};
     use crate::{ItemId, ItemNavHistory, Pane, Workspace, WorkspaceId};
     use gpui::{
         AnyElement, AppContext, Context as _, EntityId, EventEmitter, FocusableView,
@@ -802,6 +895,14 @@ pub mod test {
     }
 
     impl project::Item for TestProjectItem {
+        fn try_open(
+            _project: &Model<Project>,
+            _path: &ProjectPath,
+            _cx: &mut AppContext,
+        ) -> Option<Task<gpui::Result<Model<Self>>>> {
+            None
+        }
+
         fn entry_id(&self, _: &AppContext) -> Option<ProjectEntryId> {
             self.entry_id
         }
@@ -851,7 +952,7 @@ pub mod test {
                 nav_history: None,
                 tab_descriptions: None,
                 tab_detail: Default::default(),
-                workspace_id: 0,
+                workspace_id: Default::default(),
                 focus_handle: cx.focus_handle(),
             }
         }
@@ -934,11 +1035,10 @@ pub mod test {
 
         fn tab_content(
             &self,
-            detail: Option<usize>,
-            _selected: bool,
+            params: TabContentParams,
             _cx: &ui::prelude::WindowContext,
         ) -> AnyElement {
-            self.tab_detail.set(detail);
+            self.tab_detail.set(params.detail);
             gpui::div().into_any_element()
         }
 
@@ -1018,6 +1118,7 @@ pub mod test {
 
         fn save(
             &mut self,
+            _: bool,
             _: Model<Project>,
             _: &mut ViewContext<Self>,
         ) -> Task<anyhow::Result<()>> {
@@ -1029,7 +1130,7 @@ pub mod test {
         fn save_as(
             &mut self,
             _: Model<Project>,
-            _: std::path::PathBuf,
+            _: ProjectPath,
             _: &mut ViewContext<Self>,
         ) -> Task<anyhow::Result<()>> {
             self.save_as_count += 1;

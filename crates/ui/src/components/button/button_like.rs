@@ -1,8 +1,8 @@
 use gpui::{relative, DefiniteLength, MouseButton};
-use gpui::{rems, transparent_black, AnyElement, AnyView, ClickEvent, Hsla, Rems};
+use gpui::{transparent_black, AnyElement, AnyView, ClickEvent, Hsla, Rems};
 use smallvec::SmallVec;
 
-use crate::prelude::*;
+use crate::{prelude::*, Spacing};
 
 /// A trait for buttons that can be Selected. Enables setting the [`ButtonStyle`] of a button when it is selected.
 pub trait SelectableButton: Selectable {
@@ -276,12 +276,12 @@ pub enum ButtonSize {
 }
 
 impl ButtonSize {
-    fn height(self) -> Rems {
+    pub fn rems(self) -> Rems {
         match self {
-            ButtonSize::Large => rems(32. / 16.),
-            ButtonSize::Default => rems(22. / 16.),
-            ButtonSize::Compact => rems(18. / 16.),
-            ButtonSize::None => rems(16. / 16.),
+            ButtonSize::Large => rems_from_px(32.),
+            ButtonSize::Default => rems_from_px(22.),
+            ButtonSize::Compact => rems_from_px(18.),
+            ButtonSize::None => rems_from_px(16.),
         }
     }
 }
@@ -424,17 +424,17 @@ impl RenderOnce for ButtonLike {
             .id(self.id.clone())
             .group("")
             .flex_none()
-            .h(self.height.unwrap_or(self.size.height().into()))
+            .h(self.height.unwrap_or(self.size.rems().into()))
             .when_some(self.width, |this, width| this.w(width).justify_center())
             .when_some(self.rounding, |this, rounding| match rounding {
                 ButtonLikeRounding::All => this.rounded_md(),
                 ButtonLikeRounding::Left => this.rounded_l_md(),
                 ButtonLikeRounding::Right => this.rounded_r_md(),
             })
-            .gap_1()
+            .gap(Spacing::Small.rems(cx))
             .map(|this| match self.size {
-                ButtonSize::Large => this.px_2(),
-                ButtonSize::Default | ButtonSize::Compact => this.px_1(),
+                ButtonSize::Large => this.px(Spacing::Medium.rems(cx)),
+                ButtonSize::Default | ButtonSize::Compact => this.px(Spacing::Small.rems(cx)),
                 ButtonSize::None => this,
             })
             .bg(style.enabled(cx).background)

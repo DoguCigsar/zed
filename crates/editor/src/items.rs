@@ -1,43 +1,41 @@
 use crate::{
     editor_settings::SeedQuerySetting, persistence::DB, scroll::ScrollAnchor, Anchor, Autoscroll,
     Editor, EditorEvent, EditorSettings, ExcerptId, ExcerptRange, MultiBuffer, MultiBufferSnapshot,
-    NavigationData, ToPoint as _,
+    NavigationData, SearchWithinRange, ToPoint as _,
 };
 use anyhow::{anyhow, Context as _, Result};
 use collections::HashSet;
 use futures::future::try_join_all;
+use git::repository::GitFileStatus;
 use gpui::{
-    div, point, AnyElement, AppContext, AsyncWindowContext, Context, Entity, EntityId,
-    EventEmitter, IntoElement, Model, ParentElement, Pixels, Render, SharedString, Styled,
-    Subscription, Task, View, ViewContext, VisualContext, WeakView, WindowContext,
+    point, AnyElement, AppContext, AsyncWindowContext, Context, Entity, EntityId, EventEmitter,
+    IntoElement, Model, ParentElement, Pixels, SharedString, Styled, Task, View, ViewContext,
+    VisualContext, WeakView, WindowContext,
 };
 use language::{
     proto::serialize_anchor as serialize_text_anchor, Bias, Buffer, CharKind, OffsetRangeExt,
     Point, SelectionGoal,
 };
-use project::repository::GitFileStatus;
+use multi_buffer::AnchorRangeExt;
 use project::{search::SearchQuery, FormatTrigger, Item as _, Project, ProjectPath};
 use rpc::proto::{self, update_view, PeerId};
 use settings::Settings;
-use workspace::item::ItemSettings;
+use workspace::item::{ItemSettings, TabContentParams};
 
-use std::fmt::Write;
 use std::{
+    any::TypeId,
     borrow::Cow,
     cmp::{self, Ordering},
     iter,
     ops::Range,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 use text::{BufferId, Selection};
-use theme::Theme;
+use theme::{Theme, ThemeSettings};
 use ui::{h_flex, prelude::*, Label};
-use util::{paths::PathExt, paths::FILE_ROW_COLUMN_DELIMITER, ResultExt, TryFutureExt};
-use workspace::{
-    item::{BreadcrumbText, FollowEvent, FollowableItemHandle},
-    StatusItemView,
-};
+use util::{paths::PathExt, ResultExt, TryFutureExt};
+use workspace::item::{BreadcrumbText, FollowEvent, FollowableItemHandle};
 use workspace::{
     item::{FollowableItem, Item, ItemEvent, ItemHandle, ProjectItem},
     searchable::{Direction, SearchEvent, SearchableItem, SearchableItemHandle},
@@ -85,6 +83,7 @@ impl FollowableItem for Editor {
             let mut buffers = futures::future::try_join_all(buffers?)
                 .await
                 .debug_assert_ok("leaders don't share views for unshared buffers")?;
+
             let editor = pane.update(&mut cx, |pane, cx| {
                 let mut editors = pane.items_of_type::<Self>();
                 editors.find(|editor| {
@@ -593,36 +592,27 @@ impl Item for Editor {
         None
     }
 
-    fn tab_description<'a>(&self, detail: usize, cx: &'a AppContext) -> Option<SharedString> {
+    fn tab_description(&self, detail: usize, cx: &AppContext) -> Option<SharedString> {
         let path = path_for_buffer(&self.buffer, detail, true, cx)?;
         Some(path.to_string_lossy().to_string().into())
     }
 
-    fn tab_content(&self, detail: Option<usize>, selected: bool, cx: &WindowContext) -> AnyElement {
-        let git_status = if ItemSettings::get_global(cx).git_status {
+    fn tab_content(&self, params: TabContentParams, cx: &WindowContext) -> AnyElement {
+        let label_color = if ItemSettings::get_global(cx).git_status {
             self.buffer()
                 .read(cx)
                 .as_singleton()
                 .and_then(|buffer| buffer.read(cx).project_path(cx))
                 .and_then(|path| self.project.as_ref()?.read(cx).entry_for_path(&path, cx))
-                .and_then(|entry| entry.git_status())
+                .map(|entry| {
+                    entry_git_aware_label_color(entry.git_status, entry.is_ignored, params.selected)
+                })
+                .unwrap_or_else(|| entry_label_color(params.selected))
         } else {
-            None
-        };
-        let label_color = match git_status {
-            Some(GitFileStatus::Added) => Color::Created,
-            Some(GitFileStatus::Modified) => Color::Modified,
-            Some(GitFileStatus::Conflict) => Color::Conflict,
-            None => {
-                if selected {
-                    Color::Default
-                } else {
-                    Color::Muted
-                }
-            }
+            entry_label_color(params.selected)
         };
 
-        let description = detail.and_then(|detail| {
+        let description = params.detail.and_then(|detail| {
             let path = path_for_buffer(&self.buffer, detail, false, cx)?;
             let description = path.to_string_lossy();
             let description = description.trim();
@@ -636,7 +626,11 @@ impl Item for Editor {
 
         h_flex()
             .gap_2()
-            .child(Label::new(self.title(cx).to_string()).color(label_color))
+            .child(
+                Label::new(self.title(cx).to_string())
+                    .color(label_color)
+                    .italic(params.preview),
+            )
             .when_some(description, |this, description| {
                 this.child(
                     Label::new(description)
@@ -702,21 +696,31 @@ impl Item for Editor {
         }
     }
 
-    fn save(&mut self, project: Model<Project>, cx: &mut ViewContext<Self>) -> Task<Result<()>> {
+    fn save(
+        &mut self,
+        format: bool,
+        project: Model<Project>,
+        cx: &mut ViewContext<Self>,
+    ) -> Task<Result<()>> {
         self.report_editor_event("save", None, cx);
-        let format = self.perform_format(project.clone(), FormatTrigger::Save, cx);
         let buffers = self.buffer().clone().read(cx).all_buffers();
-        cx.spawn(|_, mut cx| async move {
-            format.await?;
+        cx.spawn(|this, mut cx| async move {
+            if format {
+                this.update(&mut cx, |editor, cx| {
+                    editor.perform_format(project.clone(), FormatTrigger::Save, cx)
+                })?
+                .await?;
+            }
 
             if buffers.len() == 1 {
+                // Apply full save routine for singleton buffers, to allow to `touch` the file via the editor.
                 project
                     .update(&mut cx, |project, cx| project.save_buffers(buffers, cx))?
                     .await?;
             } else {
-                // For multi-buffers, only save those ones that contain changes. For clean buffers
-                // we simulate saving by calling `Buffer::did_save`, so that language servers or
-                // other downstream listeners of save events get notified.
+                // For multi-buffers, only format and save the buffers with changes.
+                // For clean buffers, we simulate saving by calling `Buffer::did_save`,
+                // so that language servers or other downstream listeners of save events get notified.
                 let (dirty_buffers, clean_buffers) = buffers.into_iter().partition(|buffer| {
                     buffer
                         .update(&mut cx, |buffer, _| {
@@ -734,9 +738,8 @@ impl Item for Editor {
                     buffer
                         .update(&mut cx, |buffer, cx| {
                             let version = buffer.saved_version().clone();
-                            let fingerprint = buffer.saved_version_fingerprint();
                             let mtime = buffer.saved_mtime();
-                            buffer.did_save(version, fingerprint, mtime, cx);
+                            buffer.did_save(version, mtime, cx);
                         })
                         .ok();
                 }
@@ -749,7 +752,7 @@ impl Item for Editor {
     fn save_as(
         &mut self,
         project: Model<Project>,
-        abs_path: PathBuf,
+        path: ProjectPath,
         cx: &mut ViewContext<Self>,
     ) -> Task<Result<()>> {
         let buffer = self
@@ -758,14 +761,13 @@ impl Item for Editor {
             .as_singleton()
             .expect("cannot call save_as on an excerpt list");
 
-        let file_extension = abs_path
+        let file_extension = path
+            .path
             .extension()
             .map(|a| a.to_string_lossy().to_string());
         self.report_editor_event("save", file_extension, cx);
 
-        project.update(cx, |project, cx| {
-            project.save_buffer_as(buffer, abs_path, cx)
-        })
+        project.update(cx, |project, cx| project.save_buffer_as(buffer, path, cx))
     }
 
     fn reload(&mut self, project: Model<Project>, cx: &mut ViewContext<Self>) -> Task<Result<()>> {
@@ -827,13 +829,18 @@ impl Item for Editor {
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_else(|| "untitled".to_string());
 
+        let settings = ThemeSettings::get_global(cx);
+
         let mut breadcrumbs = vec![BreadcrumbText {
             text: filename,
             highlights: None,
+            font: Some(settings.buffer_font.clone()),
         }];
+
         breadcrumbs.extend(symbols.into_iter().map(|symbol| BreadcrumbText {
             text: symbol.text,
             highlights: Some(symbol.highlight_ranges),
+            font: Some(settings.buffer_font.clone()),
         }));
         Some(breadcrumbs)
     }
@@ -950,14 +957,14 @@ impl Item for Editor {
                     let buffer = project_item
                         .downcast::<Buffer>()
                         .map_err(|_| anyhow!("Project item at stored path was not a buffer"))?;
-                    Ok(pane.update(&mut cx, |_, cx| {
+                    pane.update(&mut cx, |_, cx| {
                         cx.new_view(|cx| {
                             let mut editor = Editor::for_buffer(buffer, Some(project), cx);
 
                             editor.read_scroll_position_from_db(item_id, workspace_id, cx);
                             editor
                         })
-                    })?)
+                    })
                 })
             })
             .unwrap_or_else(|error| Task::ready(Err(error)))
@@ -986,12 +993,16 @@ impl SearchableItem for Editor {
         self.clear_background_highlights::<BufferSearchHighlights>(cx);
     }
 
-    fn update_matches(&mut self, matches: Vec<Range<Anchor>>, cx: &mut ViewContext<Self>) {
+    fn update_matches(&mut self, matches: &[Range<Anchor>], cx: &mut ViewContext<Self>) {
         self.highlight_background::<BufferSearchHighlights>(
             matches,
             |theme| theme.search_match_background,
             cx,
         );
+    }
+
+    fn has_filtered_search_ranges(&mut self) -> bool {
+        self.has_background_highlights::<SearchWithinRange>()
     }
 
     fn query_suggestion(&mut self, cx: &mut ViewContext<Self>) -> String {
@@ -1023,7 +1034,7 @@ impl SearchableItem for Editor {
     fn activate_match(
         &mut self,
         index: usize,
-        matches: Vec<Range<Anchor>>,
+        matches: &[Range<Anchor>],
         cx: &mut ViewContext<Self>,
     ) {
         self.unfold_ranges([matches[index].clone()], false, true, cx);
@@ -1033,10 +1044,10 @@ impl SearchableItem for Editor {
         })
     }
 
-    fn select_matches(&mut self, matches: Vec<Self::Match>, cx: &mut ViewContext<Self>) {
-        self.unfold_ranges(matches.clone(), false, false, cx);
+    fn select_matches(&mut self, matches: &[Self::Match], cx: &mut ViewContext<Self>) {
+        self.unfold_ranges(matches.to_vec(), false, false, cx);
         let mut ranges = Vec::new();
-        for m in &matches {
+        for m in matches {
             ranges.push(self.range_for_match(&m))
         }
         self.change_selections(None, cx, |s| s.select_ranges(ranges));
@@ -1065,7 +1076,7 @@ impl SearchableItem for Editor {
     }
     fn match_index_for_direction(
         &mut self,
-        matches: &Vec<Range<Anchor>>,
+        matches: &[Range<Anchor>],
         current_index: usize,
         direction: Direction,
         count: usize,
@@ -1118,18 +1129,37 @@ impl SearchableItem for Editor {
         cx: &mut ViewContext<Self>,
     ) -> Task<Vec<Range<Anchor>>> {
         let buffer = self.buffer().read(cx).snapshot(cx);
+        let search_within_ranges = self
+            .background_highlights
+            .get(&TypeId::of::<SearchWithinRange>())
+            .map(|(_color, ranges)| {
+                ranges
+                    .iter()
+                    .map(|range| range.to_offset(&buffer))
+                    .collect::<Vec<_>>()
+            });
         cx.background_executor().spawn(async move {
             let mut ranges = Vec::new();
             if let Some((_, _, excerpt_buffer)) = buffer.as_singleton() {
-                ranges.extend(
-                    query
-                        .search(excerpt_buffer, None)
-                        .await
-                        .into_iter()
-                        .map(|range| {
-                            buffer.anchor_after(range.start)..buffer.anchor_before(range.end)
-                        }),
-                );
+                if let Some(search_within_ranges) = search_within_ranges {
+                    for range in search_within_ranges {
+                        let offset = range.start;
+                        ranges.extend(
+                            query
+                                .search(excerpt_buffer, Some(range))
+                                .await
+                                .into_iter()
+                                .map(|range| {
+                                    buffer.anchor_after(range.start + offset)
+                                        ..buffer.anchor_before(range.end + offset)
+                                }),
+                        );
+                    }
+                } else {
+                    ranges.extend(query.search(excerpt_buffer, None).await.into_iter().map(
+                        |range| buffer.anchor_after(range.start)..buffer.anchor_before(range.end),
+                    ));
+                }
             } else {
                 for excerpt in buffer.excerpt_boundaries_in_range(0..buffer.len()) {
                     let excerpt_range = excerpt.range.context.to_offset(&excerpt.buffer);
@@ -1145,8 +1175,8 @@ impl SearchableItem for Editor {
                                 let end = excerpt
                                     .buffer
                                     .anchor_before(excerpt_range.start + range.end);
-                                buffer.anchor_in_excerpt(excerpt.id.clone(), start)
-                                    ..buffer.anchor_in_excerpt(excerpt.id.clone(), end)
+                                buffer.anchor_in_excerpt(excerpt.id, start).unwrap()
+                                    ..buffer.anchor_in_excerpt(excerpt.id, end).unwrap()
                             }),
                     );
                 }
@@ -1157,14 +1187,18 @@ impl SearchableItem for Editor {
 
     fn active_match_index(
         &mut self,
-        matches: Vec<Range<Anchor>>,
+        matches: &[Range<Anchor>],
         cx: &mut ViewContext<Self>,
     ) -> Option<usize> {
         active_match_index(
-            &matches,
+            matches,
             &self.selections.newest_anchor().head(),
             &self.buffer().read(cx).snapshot(cx),
         )
+    }
+
+    fn search_bar_visibility_changed(&mut self, _visible: bool, _cx: &mut ViewContext<Self>) {
+        self.expect_bounds_change = self.last_bounds;
     }
 }
 
@@ -1177,9 +1211,9 @@ pub fn active_match_index(
         None
     } else {
         match ranges.binary_search_by(|probe| {
-            if probe.end.cmp(cursor, &*buffer).is_lt() {
+            if probe.end.cmp(cursor, buffer).is_lt() {
                 Ordering::Less
-            } else if probe.start.cmp(cursor, &*buffer).is_gt() {
+            } else if probe.start.cmp(cursor, buffer).is_gt() {
                 Ordering::Greater
             } else {
                 Ordering::Equal
@@ -1190,80 +1224,28 @@ pub fn active_match_index(
     }
 }
 
-pub struct CursorPosition {
-    position: Option<Point>,
-    selected_count: usize,
-    _observe_active_editor: Option<Subscription>,
-}
-
-impl Default for CursorPosition {
-    fn default() -> Self {
-        Self::new()
+pub fn entry_label_color(selected: bool) -> Color {
+    if selected {
+        Color::Default
+    } else {
+        Color::Muted
     }
 }
 
-impl CursorPosition {
-    pub fn new() -> Self {
-        Self {
-            position: None,
-            selected_count: 0,
-            _observe_active_editor: None,
+pub fn entry_git_aware_label_color(
+    git_status: Option<GitFileStatus>,
+    ignored: bool,
+    selected: bool,
+) -> Color {
+    if ignored {
+        Color::Ignored
+    } else {
+        match git_status {
+            Some(GitFileStatus::Added) => Color::Created,
+            Some(GitFileStatus::Modified) => Color::Modified,
+            Some(GitFileStatus::Conflict) => Color::Conflict,
+            None => entry_label_color(selected),
         }
-    }
-
-    fn update_position(&mut self, editor: View<Editor>, cx: &mut ViewContext<Self>) {
-        let editor = editor.read(cx);
-        let buffer = editor.buffer().read(cx).snapshot(cx);
-
-        self.selected_count = 0;
-        let mut last_selection: Option<Selection<usize>> = None;
-        for selection in editor.selections.all::<usize>(cx) {
-            self.selected_count += selection.end - selection.start;
-            if last_selection
-                .as_ref()
-                .map_or(true, |last_selection| selection.id > last_selection.id)
-            {
-                last_selection = Some(selection);
-            }
-        }
-        self.position = last_selection.map(|s| s.head().to_point(&buffer));
-
-        cx.notify();
-    }
-}
-
-impl Render for CursorPosition {
-    fn render(&mut self, _: &mut ViewContext<Self>) -> impl IntoElement {
-        div().when_some(self.position, |el, position| {
-            let mut text = format!(
-                "{}{FILE_ROW_COLUMN_DELIMITER}{}",
-                position.row + 1,
-                position.column + 1
-            );
-            if self.selected_count > 0 {
-                write!(text, " ({} selected)", self.selected_count).unwrap();
-            }
-
-            el.child(Label::new(text).size(LabelSize::Small))
-        })
-    }
-}
-
-impl StatusItemView for CursorPosition {
-    fn set_active_pane_item(
-        &mut self,
-        active_pane_item: Option<&dyn ItemHandle>,
-        cx: &mut ViewContext<Self>,
-    ) {
-        if let Some(editor) = active_pane_item.and_then(|item| item.act_as::<Editor>(cx)) {
-            self._observe_active_editor = Some(cx.observe(&editor, Self::update_position));
-            self.update_position(editor, cx);
-        } else {
-            self.position = None;
-            self._observe_active_editor = None;
-        }
-
-        cx.notify();
     }
 }
 
@@ -1319,65 +1301,15 @@ fn path_for_file<'a>(
 mod tests {
     use super::*;
     use gpui::AppContext;
-    use std::{
-        path::{Path, PathBuf},
-        sync::Arc,
-        time::SystemTime,
-    };
+    use language::TestFile;
+    use std::path::Path;
 
     #[gpui::test]
     fn test_path_for_file(cx: &mut AppContext) {
         let file = TestFile {
             path: Path::new("").into(),
-            full_path: PathBuf::from(""),
+            root_name: String::new(),
         };
         assert_eq!(path_for_file(&file, 0, false, cx), None);
-    }
-
-    struct TestFile {
-        path: Arc<Path>,
-        full_path: PathBuf,
-    }
-
-    impl language::File for TestFile {
-        fn path(&self) -> &Arc<Path> {
-            &self.path
-        }
-
-        fn full_path(&self, _: &gpui::AppContext) -> PathBuf {
-            self.full_path.clone()
-        }
-
-        fn as_local(&self) -> Option<&dyn language::LocalFile> {
-            unimplemented!()
-        }
-
-        fn mtime(&self) -> SystemTime {
-            unimplemented!()
-        }
-
-        fn file_name<'a>(&'a self, _: &'a gpui::AppContext) -> &'a std::ffi::OsStr {
-            unimplemented!()
-        }
-
-        fn worktree_id(&self) -> usize {
-            0
-        }
-
-        fn is_deleted(&self) -> bool {
-            unimplemented!()
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            unimplemented!()
-        }
-
-        fn to_proto(&self) -> rpc::proto::File {
-            unimplemented!()
-        }
-
-        fn is_private(&self) -> bool {
-            false
-        }
     }
 }

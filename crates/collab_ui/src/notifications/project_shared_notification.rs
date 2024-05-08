@@ -6,7 +6,7 @@ use collections::HashMap;
 use gpui::{AppContext, Size};
 use settings::Settings;
 use std::sync::{Arc, Weak};
-use theme::{SystemAppearance, ThemeSettings};
+use theme::ThemeSettings;
 use ui::{prelude::*, Button, Label};
 use workspace::AppState;
 
@@ -26,10 +26,8 @@ pub fn init(app_state: &Arc<AppState>, cx: &mut AppContext) {
             };
 
             for screen in cx.displays() {
-                let options = notification_window_options(screen, window_size);
+                let options = notification_window_options(screen, window_size, cx);
                 let window = cx.open_window(options, |cx| {
-                    SystemAppearance::init_for_window(cx);
-
                     cx.new_view(|_| {
                         ProjectSharedNotification::new(
                             owner.clone(),
@@ -60,7 +58,7 @@ pub fn init(app_state: &Arc<AppState>, cx: &mut AppContext) {
             }
         }
 
-        room::Event::Left { .. } => {
+        room::Event::RoomLeft { .. } => {
             for (_, windows) in notification_windows.drain() {
                 for window in windows {
                     window
@@ -100,7 +98,7 @@ impl ProjectSharedNotification {
 
     fn join(&mut self, cx: &mut ViewContext<Self>) {
         if let Some(app_state) = self.app_state.upgrade() {
-            workspace::join_remote_project(self.project_id, self.owner.id, app_state, cx)
+            workspace::join_in_room_project(self.project_id, self.owner.id, app_state, cx)
                 .detach_and_log_err(cx);
         }
     }
@@ -125,13 +123,13 @@ impl Render for ProjectSharedNotification {
             let theme_settings = ThemeSettings::get_global(cx);
             (
                 theme_settings.ui_font.family.clone(),
-                theme_settings.ui_font_size.clone(),
+                theme_settings.ui_font_size,
             )
         };
 
         cx.set_rem_size(ui_font_size);
 
-        div().size_full().font(ui_font).child(
+        div().size_full().font_family(ui_font).child(
             CollabNotification::new(
                 self.owner.avatar_uri.clone(),
                 Button::new("open", "Open").on_click(cx.listener(move |this, _event, cx| {

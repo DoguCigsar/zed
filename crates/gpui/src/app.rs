@@ -1,32 +1,3 @@
-mod async_context;
-mod entity_map;
-mod model_context;
-#[cfg(any(test, feature = "test-support"))]
-mod test_context;
-
-pub use async_context::*;
-use derive_more::{Deref, DerefMut};
-pub use entity_map::*;
-pub use model_context::*;
-use refineable::Refineable;
-use smol::future::FutureExt;
-#[cfg(any(test, feature = "test-support"))]
-pub use test_context::*;
-use time::UtcOffset;
-
-use crate::{
-    current_platform, image_cache::ImageCache, init_app_menus, Action, ActionRegistry, Any,
-    AnyView, AnyWindowHandle, AppMetadata, AssetSource, BackgroundExecutor, ClipboardItem, Context,
-    DispatchPhase, DisplayId, Entity, EventEmitter, ForegroundExecutor, Global, KeyBinding, Keymap,
-    Keystroke, LayoutId, Menu, PathPromptOptions, Pixels, Platform, PlatformDisplay, Point, Render,
-    SharedString, SubscriberSet, Subscription, SvgRenderer, Task, TextStyle, TextStyleRefinement,
-    TextSystem, View, ViewContext, Window, WindowContext, WindowHandle, WindowId,
-};
-use anyhow::{anyhow, Result};
-use collections::{FxHashMap, FxHashSet, VecDeque};
-use futures::{channel::oneshot, future::LocalBoxFuture, Future};
-
-use slotmap::SlotMap;
 use std::{
     any::{type_name, TypeId},
     cell::{Ref, RefCell, RefMut},
@@ -37,10 +8,40 @@ use std::{
     sync::{atomic::Ordering::SeqCst, Arc},
     time::Duration,
 };
+
+use anyhow::{anyhow, Result};
+use derive_more::{Deref, DerefMut};
+use futures::{channel::oneshot, future::LocalBoxFuture, Future};
+use slotmap::SlotMap;
+use smol::future::FutureExt;
+use time::UtcOffset;
+
+pub use async_context::*;
+use collections::{FxHashMap, FxHashSet, VecDeque};
+pub use entity_map::*;
+pub use model_context::*;
+#[cfg(any(test, feature = "test-support"))]
+pub use test_context::*;
 use util::{
     http::{self, HttpClient},
     ResultExt,
 };
+
+use crate::{
+    current_platform, init_app_menus, Action, ActionRegistry, Any, AnyView, AnyWindowHandle,
+    AppMetadata, AssetCache, AssetSource, BackgroundExecutor, ClipboardItem, Context,
+    DispatchPhase, DisplayId, Entity, EventEmitter, ForegroundExecutor, Global, KeyBinding, Keymap,
+    Keystroke, LayoutId, Menu, PathPromptOptions, Pixels, Platform, PlatformDisplay, Point,
+    PromptBuilder, PromptHandle, PromptLevel, Render, RenderablePromptHandle, Reservation,
+    SharedString, SubscriberSet, Subscription, SvgRenderer, Task, TextSystem, View, ViewContext,
+    Window, WindowAppearance, WindowContext, WindowHandle, WindowId,
+};
+
+mod async_context;
+mod entity_map;
+mod model_context;
+#[cfg(any(test, feature = "test-support"))]
+mod test_context;
 
 /// The duration for which futures returned from [AppContext::on_app_context] or [ModelContext::on_app_quit] can run before the application fully quits.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -110,6 +111,9 @@ impl App {
     /// Builds an app with the given asset source.
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
+        #[cfg(any(test, feature = "test-support"))]
+        log::info!("GPUI was compiled in test mode");
+
         Self(AppContext::new(
             current_platform(),
             Arc::new(()),
@@ -145,14 +149,9 @@ impl App {
     /// to open one or more URLs.
     pub fn on_open_urls<F>(&self, mut callback: F) -> &Self
     where
-        F: 'static + FnMut(Vec<String>, &mut AppContext),
+        F: 'static + FnMut(Vec<String>),
     {
-        let this = Rc::downgrade(&self.0);
-        self.0.borrow().platform.on_open_urls(Box::new(move |urls| {
-            if let Some(app) = this.upgrade() {
-                callback(urls, &mut app.borrow_mut());
-            }
-        }));
+        self.0.borrow().platform.on_open_urls(Box::new(callback));
         self
     }
 
@@ -190,9 +189,13 @@ impl App {
     pub fn text_system(&self) -> Arc<TextSystem> {
         self.0.borrow().text_system.clone()
     }
+
+    /// Returns the file URL of the executable with the specified name in the application bundle
+    pub fn path_for_auxiliary_executable(&self, name: &str) -> Result<PathBuf> {
+        self.0.borrow().path_for_auxiliary_executable(name)
+    }
 }
 
-pub(crate) type FrameCallback = Box<dyn FnOnce(&mut AppContext)>;
 type Handler = Box<dyn FnMut(&mut AppContext) -> bool + 'static>;
 type Listener = Box<dyn FnMut(&dyn Any, &mut AppContext) -> bool + 'static>;
 type KeystrokeObserver = Box<dyn FnMut(&KeystrokeEvent, &mut WindowContext) + 'static>;
@@ -212,18 +215,18 @@ pub struct AppContext {
     pending_updates: usize,
     pub(crate) actions: Rc<ActionRegistry>,
     pub(crate) active_drag: Option<AnyDrag>,
-    pub(crate) next_frame_callbacks: FxHashMap<DisplayId, Vec<FrameCallback>>,
-    pub(crate) frame_consumers: FxHashMap<DisplayId, Task<()>>,
     pub(crate) background_executor: BackgroundExecutor,
     pub(crate) foreground_executor: ForegroundExecutor,
-    pub(crate) svg_renderer: SvgRenderer,
+    pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
+    pub(crate) asset_cache: AssetCache,
     asset_source: Arc<dyn AssetSource>,
-    pub(crate) image_cache: ImageCache,
-    pub(crate) text_style_stack: Vec<TextStyleRefinement>,
+    pub(crate) svg_renderer: SvgRenderer,
+    http_client: Arc<dyn HttpClient>,
     pub(crate) globals_by_type: FxHashMap<TypeId, Box<dyn Any>>,
     pub(crate) entities: EntityMap,
     pub(crate) new_view_observers: SubscriberSet<TypeId, NewViewListener>,
     pub(crate) windows: SlotMap<WindowId, Option<Window>>,
+    pub(crate) window_handles: FxHashMap<WindowId, AnyWindowHandle>,
     pub(crate) keymap: Rc<RefCell<Keymap>>,
     pub(crate) global_action_listeners:
         FxHashMap<TypeId, Vec<Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Self)>>>,
@@ -239,6 +242,7 @@ pub struct AppContext {
     pub(crate) quit_observers: SubscriberSet<(), QuitHandler>,
     pub(crate) layout_id_buffer: Vec<LayoutId>, // We recycle this memory across layout requests.
     pub(crate) propagate_event: bool,
+    pub(crate) prompt_builder: Option<PromptBuilder>,
 }
 
 impl AppContext {
@@ -274,17 +278,17 @@ impl AppContext {
                 flushing_effects: false,
                 pending_updates: 0,
                 active_drag: None,
-                next_frame_callbacks: FxHashMap::default(),
-                frame_consumers: FxHashMap::default(),
                 background_executor: executor,
                 foreground_executor,
                 svg_renderer: SvgRenderer::new(asset_source.clone()),
+                asset_cache: AssetCache::new(),
+                loading_assets: Default::default(),
                 asset_source,
-                image_cache: ImageCache::new(http_client),
-                text_style_stack: Vec::new(),
+                http_client,
                 globals_by_type: FxHashMap::default(),
                 entities,
                 new_view_observers: SubscriberSet::new(),
+                window_handles: FxHashMap::default(),
                 windows: SlotMap::with_key(),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
                 global_action_listeners: FxHashMap::default(),
@@ -299,6 +303,7 @@ impl AppContext {
                 quit_observers: SubscriberSet::new(),
                 layout_id_buffer: Default::default(),
                 propagate_event: true,
+                prompt_builder: Some(PromptBuilder::Default),
             }),
         });
 
@@ -324,6 +329,7 @@ impl AppContext {
         }
 
         self.windows.clear();
+        self.window_handles.clear();
         self.flush_effects();
 
         let futures = futures::future::join_all(futures);
@@ -380,6 +386,11 @@ impl AppContext {
         })
     }
 
+    pub(crate) fn new_observer(&mut self, key: EntityId, value: Handler) -> Subscription {
+        let (subscription, activate) = self.observers.insert(key, value);
+        self.defer(move |_| activate());
+        subscription
+    }
     pub(crate) fn observe_internal<W, E>(
         &mut self,
         entity: &E,
@@ -391,7 +402,7 @@ impl AppContext {
     {
         let entity_id = entity.entity_id();
         let handle = entity.downgrade();
-        let (subscription, activate) = self.observers.insert(
+        self.new_observer(
             entity_id,
             Box::new(move |cx| {
                 if let Some(handle) = E::upgrade_from(&handle) {
@@ -400,9 +411,7 @@ impl AppContext {
                     false
                 }
             }),
-        );
-        self.defer(move |_| activate());
-        subscription
+        )
     }
 
     /// Arrange for the given callback to be invoked whenever the given model or view emits an event of a given type.
@@ -423,6 +432,15 @@ impl AppContext {
         })
     }
 
+    pub(crate) fn new_subscription(
+        &mut self,
+        key: EntityId,
+        value: (TypeId, Listener),
+    ) -> Subscription {
+        let (subscription, activate) = self.event_listeners.insert(key, value);
+        self.defer(move |_| activate());
+        subscription
+    }
     pub(crate) fn subscribe_internal<T, E, Evt>(
         &mut self,
         entity: &E,
@@ -435,7 +453,7 @@ impl AppContext {
     {
         let entity_id = entity.entity_id();
         let entity = entity.downgrade();
-        let (subscription, activate) = self.event_listeners.insert(
+        self.new_subscription(
             entity_id,
             (
                 TypeId::of::<Evt>(),
@@ -448,9 +466,7 @@ impl AppContext {
                     }
                 }),
             ),
-        );
-        self.defer(move |_| activate());
-        subscription
+        )
     }
 
     /// Returns handles to all open windows in the application.
@@ -458,8 +474,8 @@ impl AppContext {
     /// To find all windows of a given type, you could filter on
     pub fn windows(&self) -> Vec<AnyWindowHandle> {
         self.windows
-            .values()
-            .filter_map(|window| Some(window.as_ref()?.handle))
+            .keys()
+            .flat_map(|window_id| self.window_handles.get(&window_id).copied())
             .collect()
     }
 
@@ -482,6 +498,7 @@ impl AppContext {
             let mut window = Window::new(handle.into(), options, cx);
             let root_view = build_root_view(&mut WindowContext::new(cx, &mut window));
             window.root_view.replace(root_view.into());
+            cx.window_handles.insert(id, window.handle);
             cx.windows.get_mut(id).unwrap().replace(window);
             handle
         })
@@ -512,9 +529,39 @@ impl AppContext {
         self.platform.displays()
     }
 
+    /// Returns the primary display that will be used for new windows.
+    pub fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
+        self.platform.primary_display()
+    }
+
+    /// Returns the display with the given ID, if one exists.
+    pub fn find_display(&self, id: DisplayId) -> Option<Rc<dyn PlatformDisplay>> {
+        self.displays()
+            .iter()
+            .find(|display| display.id() == id)
+            .cloned()
+    }
+
+    /// Returns the appearance of the application's windows.
+    pub fn window_appearance(&self) -> WindowAppearance {
+        self.platform.window_appearance()
+    }
+
+    /// Writes data to the primary selection buffer.
+    /// Only available on Linux.
+    pub fn write_to_primary(&self, item: ClipboardItem) {
+        self.platform.write_to_primary(item)
+    }
+
     /// Writes data to the platform clipboard.
     pub fn write_to_clipboard(&self, item: ClipboardItem) {
         self.platform.write_to_clipboard(item)
+    }
+
+    /// Reads data from the primary selection buffer.
+    /// Only available on Linux.
+    pub fn read_from_primary(&self) -> Option<ClipboardItem> {
+        self.platform.read_from_primary()
     }
 
     /// Reads data from the platform clipboard.
@@ -547,6 +594,14 @@ impl AppContext {
         self.platform.open_url(url);
     }
 
+    /// register_url_scheme requests that the given scheme (e.g. `zed` for `zed://` urls)
+    /// is opened by the current app.
+    /// On some platforms (e.g. macOS) you may be able to register URL schemes as part of app
+    /// distribution, but this method exists to let you register schemes at runtime.
+    pub fn register_url_scheme(&self, scheme: &str) -> Task<Result<()>> {
+        self.platform.register_url_scheme(scheme)
+    }
+
     /// Returns the full pathname of the current app bundle.
     /// If the app is not being run from a bundle, returns an error.
     pub fn app_path(&self) -> Result<PathBuf> {
@@ -556,11 +611,6 @@ impl AppContext {
     /// Returns the file URL of the executable with the specified name in the application bundle
     pub fn path_for_auxiliary_executable(&self, name: &str) -> Result<PathBuf> {
         self.platform.path_for_auxiliary_executable(name)
-    }
-
-    /// Returns the maximum duration in which a second mouse click must occur for an event to be a double-click event.
-    pub fn double_click_interval(&self) -> Duration {
-        self.platform.double_click_interval()
     }
 
     /// Displays a platform modal for selecting paths.
@@ -592,13 +642,23 @@ impl AppContext {
     }
 
     /// Restart the application.
-    pub fn restart(&self) {
-        self.platform.restart()
+    pub fn restart(&self, binary_path: Option<PathBuf>) {
+        self.platform.restart(binary_path)
     }
 
     /// Returns the local timezone at the platform level.
     pub fn local_timezone(&self) -> UtcOffset {
         self.platform.local_timezone()
+    }
+
+    /// Returns the http client assigned to GPUI
+    pub fn http_client(&self) -> Arc<dyn HttpClient> {
+        self.http_client.clone()
+    }
+
+    /// Returns the SVG renderer GPUI uses
+    pub(crate) fn svg_renderer(&self) -> SvgRenderer {
+        self.svg_renderer.clone()
     }
 
     pub(crate) fn push_effect(&mut self, effect: Effect) {
@@ -665,7 +725,6 @@ impl AppContext {
                     self.update_window(window, |_, cx| cx.draw()).unwrap();
                 }
 
-                #[allow(clippy::collapsible_else_if)]
                 if self.pending_effects.is_empty() {
                     break;
                 }
@@ -806,15 +865,6 @@ impl AppContext {
         &self.text_system
     }
 
-    /// The current text style. Which is composed of all the style refinements provided to `with_text_style`.
-    pub fn text_style(&self) -> TextStyle {
-        let mut style = TextStyle::default();
-        for refinement in &self.text_style_stack {
-            style.refine(refinement);
-        }
-        style
-    }
-
     /// Check whether a global of the given type has been assigned.
     pub fn has_global<G: Global>(&self) -> bool {
         self.globals_by_type.contains_key(&TypeId::of::<G>())
@@ -886,17 +936,6 @@ impl AppContext {
             .unwrap()
     }
 
-    /// Updates the global of the given type with a closure. Unlike `global_mut`, this method provides
-    /// your closure with mutable access to the `AppContext` and the global simultaneously.
-    pub fn update_global<G: Global, R>(&mut self, f: impl FnOnce(&mut G, &mut Self) -> R) -> R {
-        self.update(|cx| {
-            let mut global = cx.lease_global::<G>();
-            let result = f(&mut global, cx);
-            cx.end_global_lease(global);
-            result
-        })
-    }
-
     /// Register a callback to be invoked when a global of the given type is updated.
     pub fn observe_global<G: Global>(
         &mut self,
@@ -930,13 +969,22 @@ impl AppContext {
         self.globals_by_type.insert(global_type, lease.global);
     }
 
+    pub(crate) fn new_view_observer(
+        &mut self,
+        key: TypeId,
+        value: NewViewListener,
+    ) -> Subscription {
+        let (subscription, activate) = self.new_view_observers.insert(key, value);
+        activate();
+        subscription
+    }
     /// Arrange for the given function to be invoked whenever a view of the specified type is created.
     /// The function will be passed a mutable reference to the view along with an appropriate context.
     pub fn observe_new_views<V: 'static>(
         &mut self,
         on_new: impl 'static + Fn(&mut V, &mut ViewContext<V>),
     ) -> Subscription {
-        let (subscription, activate) = self.new_view_observers.insert(
+        self.new_view_observer(
             TypeId::of::<V>(),
             Box::new(move |any_view: AnyView, cx: &mut WindowContext| {
                 any_view
@@ -946,9 +994,7 @@ impl AppContext {
                         on_new(view_state, cx);
                     })
             }),
-        );
-        activate();
-        subscription
+        )
     }
 
     /// Observe the release of a model or view. The callback is invoked after the model or view
@@ -980,17 +1026,15 @@ impl AppContext {
         &mut self,
         f: impl FnMut(&KeystrokeEvent, &mut WindowContext) + 'static,
     ) -> Subscription {
-        let (subscription, activate) = self.keystroke_observers.insert((), Box::new(f));
-        activate();
-        subscription
-    }
-
-    pub(crate) fn push_text_style(&mut self, text_style: TextStyleRefinement) {
-        self.text_style_stack.push(text_style);
-    }
-
-    pub(crate) fn pop_text_style(&mut self) {
-        self.text_style_stack.pop();
+        fn inner(
+            keystroke_observers: &mut SubscriberSet<(), KeystrokeObserver>,
+            handler: KeystrokeObserver,
+        ) -> Subscription {
+            let (subscription, activate) = keystroke_observers.insert((), handler);
+            activate();
+            subscription
+        }
+        inner(&mut self.keystroke_observers, Box::new(f))
     }
 
     /// Register key bindings.
@@ -1091,21 +1135,32 @@ impl AppContext {
     /// Checks if the given action is bound in the current context, as defined by the app's current focus,
     /// the bindings in the element tree, and any global action listeners.
     pub fn is_action_available(&mut self, action: &dyn Action) -> bool {
+        let mut action_available = false;
         if let Some(window) = self.active_window() {
             if let Ok(window_action_available) =
                 window.update(self, |_, cx| cx.is_action_available(action))
             {
-                return window_action_available;
+                action_available = window_action_available;
             }
         }
 
-        self.global_action_listeners
-            .contains_key(&action.as_any().type_id())
+        action_available
+            || self
+                .global_action_listeners
+                .contains_key(&action.as_any().type_id())
     }
 
     /// Sets the menu bar for this application. This will replace any existing menu bar.
     pub fn set_menus(&mut self, menus: Vec<Menu>) {
         self.platform.set_menus(menus, &self.keymap.borrow());
+    }
+
+    /// Adds given path to the bottom of the list of recent paths for the application.
+    /// The list is usually shown on the application icon's context menu in the dock,
+    /// and allows to open the recent files via that context menu.
+    /// If the path is already in the list, it will be moved to the bottom of the list.
+    pub fn add_recent_document(&mut self, path: &Path) {
+        self.platform.add_recent_document(path);
     }
 
     /// Dispatch an action to the currently active window or global action handler
@@ -1116,14 +1171,41 @@ impl AppContext {
                 .update(self, |_, cx| cx.dispatch_action(action.boxed_clone()))
                 .log_err();
         } else {
-            self.propagate_event = true;
+            self.dispatch_global_action(action);
+        }
+    }
 
+    fn dispatch_global_action(&mut self, action: &dyn Action) {
+        self.propagate_event = true;
+
+        if let Some(mut global_listeners) = self
+            .global_action_listeners
+            .remove(&action.as_any().type_id())
+        {
+            for listener in &global_listeners {
+                listener(action.as_any(), DispatchPhase::Capture, self);
+                if !self.propagate_event {
+                    break;
+                }
+            }
+
+            global_listeners.extend(
+                self.global_action_listeners
+                    .remove(&action.as_any().type_id())
+                    .unwrap_or_default(),
+            );
+
+            self.global_action_listeners
+                .insert(action.as_any().type_id(), global_listeners);
+        }
+
+        if self.propagate_event {
             if let Some(mut global_listeners) = self
                 .global_action_listeners
                 .remove(&action.as_any().type_id())
             {
-                for listener in &global_listeners {
-                    listener(action.as_any(), DispatchPhase::Capture, self);
+                for listener in global_listeners.iter().rev() {
+                    listener(action.as_any(), DispatchPhase::Bubble, self);
                     if !self.propagate_event {
                         break;
                     }
@@ -1138,35 +1220,29 @@ impl AppContext {
                 self.global_action_listeners
                     .insert(action.as_any().type_id(), global_listeners);
             }
-
-            if self.propagate_event {
-                if let Some(mut global_listeners) = self
-                    .global_action_listeners
-                    .remove(&action.as_any().type_id())
-                {
-                    for listener in global_listeners.iter().rev() {
-                        listener(action.as_any(), DispatchPhase::Bubble, self);
-                        if !self.propagate_event {
-                            break;
-                        }
-                    }
-
-                    global_listeners.extend(
-                        self.global_action_listeners
-                            .remove(&action.as_any().type_id())
-                            .unwrap_or_default(),
-                    );
-
-                    self.global_action_listeners
-                        .insert(action.as_any().type_id(), global_listeners);
-                }
-            }
         }
     }
 
     /// Is there currently something being dragged?
     pub fn has_active_drag(&self) -> bool {
         self.active_drag.is_some()
+    }
+
+    /// Set the prompt renderer for GPUI. This will replace the default or platform specific
+    /// prompts with this custom implementation.
+    pub fn set_prompt_builder(
+        &mut self,
+        renderer: impl Fn(
+                PromptLevel,
+                &str,
+                Option<&str>,
+                &[&str],
+                PromptHandle,
+                &mut WindowContext,
+            ) -> RenderablePromptHandle
+            + 'static,
+    ) {
+        self.prompt_builder = Some(PromptBuilder::Custom(Box::new(renderer)))
     }
 }
 
@@ -1187,6 +1263,22 @@ impl Context for AppContext {
         })
     }
 
+    fn reserve_model<T: 'static>(&mut self) -> Self::Result<Reservation<T>> {
+        Reservation(self.entities.reserve())
+    }
+
+    fn insert_model<T: 'static>(
+        &mut self,
+        reservation: Reservation<T>,
+        build_model: impl FnOnce(&mut ModelContext<'_, T>) -> T,
+    ) -> Self::Result<Model<T>> {
+        self.update(|cx| {
+            let slot = reservation.0;
+            let entity = build_model(&mut ModelContext::new(cx, slot.downgrade()));
+            cx.entities.insert(slot, entity)
+        })
+    }
+
     /// Updates the entity referenced by the given model. The function is passed a mutable reference to the
     /// entity along with a `ModelContext` for the entity.
     fn update_model<T: 'static, R>(
@@ -1202,34 +1294,6 @@ impl Context for AppContext {
         })
     }
 
-    fn update_window<T, F>(&mut self, handle: AnyWindowHandle, update: F) -> Result<T>
-    where
-        F: FnOnce(AnyView, &mut WindowContext<'_>) -> T,
-    {
-        self.update(|cx| {
-            let mut window = cx
-                .windows
-                .get_mut(handle.id)
-                .ok_or_else(|| anyhow!("window not found"))?
-                .take()
-                .unwrap();
-
-            let root_view = window.root_view.clone().unwrap();
-            let result = update(root_view, &mut WindowContext::new(cx, &mut window));
-
-            if window.removed {
-                cx.windows.remove(handle.id);
-            } else {
-                cx.windows
-                    .get_mut(handle.id)
-                    .ok_or_else(|| anyhow!("window not found"))?
-                    .replace(window);
-            }
-
-            Ok(result)
-        })
-    }
-
     fn read_model<T, R>(
         &self,
         handle: &Model<T>,
@@ -1240,6 +1304,35 @@ impl Context for AppContext {
     {
         let entity = self.entities.read(handle);
         read(entity, self)
+    }
+
+    fn update_window<T, F>(&mut self, handle: AnyWindowHandle, update: F) -> Result<T>
+    where
+        F: FnOnce(AnyView, &mut WindowContext<'_>) -> T,
+    {
+        self.update(|cx| {
+            let mut window = cx
+                .windows
+                .get_mut(handle.id)
+                .ok_or_else(|| anyhow!("window not found"))?
+                .take()
+                .ok_or_else(|| anyhow!("window not found"))?;
+
+            let root_view = window.root_view.clone().unwrap();
+            let result = update(root_view, &mut WindowContext::new(cx, &mut window));
+
+            if window.removed {
+                cx.window_handles.remove(&handle.id);
+                cx.windows.remove(handle.id);
+            } else {
+                cx.windows
+                    .get_mut(handle.id)
+                    .ok_or_else(|| anyhow!("window not found"))?
+                    .replace(window);
+            }
+
+            Ok(result)
+        })
     }
 
     fn read_window<T, R>(
@@ -1335,8 +1428,8 @@ pub struct AnyTooltip {
     /// The view used to display the tooltip
     pub view: AnyView,
 
-    /// The offset from the cursor to use, relative to the parent view
-    pub cursor_offset: Point<Pixels>,
+    /// The absolute position of the mouse when the tooltip was deployed.
+    pub mouse_position: Point<Pixels>,
 }
 
 /// A keystroke event, and potentially the associated action

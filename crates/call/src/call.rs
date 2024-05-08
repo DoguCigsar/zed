@@ -5,7 +5,7 @@ pub mod room;
 use anyhow::{anyhow, Result};
 use audio::Audio;
 use call_settings::CallSettings;
-use client::{proto, Client, TypedEnvelope, User, UserStore, ZED_ALWAYS_ACTIVE};
+use client::{proto, ChannelId, Client, TypedEnvelope, User, UserStore, ZED_ALWAYS_ACTIVE};
 use collections::HashSet;
 use futures::{channel::oneshot, future::Shared, Future, FutureExt};
 use gpui::{
@@ -107,7 +107,7 @@ impl ActiveCall {
         }
     }
 
-    pub fn channel_id(&self, cx: &AppContext) -> Option<u64> {
+    pub fn channel_id(&self, cx: &AppContext) -> Option<ChannelId> {
         self.room()?.read(cx).channel_id()
     }
 
@@ -302,7 +302,7 @@ impl ActiveCall {
             return Task::ready(Ok(()));
         }
 
-        let room_id = call.room_id.clone();
+        let room_id = call.room_id;
         let client = self.client.clone();
         let user_store = self.user_store.clone();
         let join = self
@@ -336,7 +336,7 @@ impl ActiveCall {
 
     pub fn join_channel(
         &mut self,
-        channel_id: u64,
+        channel_id: ChannelId,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<Option<Model<Room>>>> {
         if let Some(room) = self.room().cloned() {
@@ -373,7 +373,10 @@ impl ActiveCall {
         self.report_call_event("hang up", cx);
 
         Audio::end_call(cx);
+
+        let channel_id = self.channel_id(cx);
         if let Some((room, _)) = self.room.take() {
+            cx.emit(Event::RoomLeft { channel_id });
             room.update(cx, |room, cx| room.leave(cx))
         } else {
             Task::ready(Ok(()))
@@ -429,7 +432,9 @@ impl ActiveCall {
         room: Option<Model<Room>>,
         cx: &mut ModelContext<Self>,
     ) -> Task<Result<()>> {
-        if room.as_ref() != self.room.as_ref().map(|room| &room.0) {
+        if room.as_ref() == self.room.as_ref().map(|room| &room.0) {
+            Task::ready(Ok(()))
+        } else {
             cx.notify();
             if let Some(room) = room {
                 if room.read(cx).status().is_offline() {
@@ -459,8 +464,6 @@ impl ActiveCall {
                 self.room = None;
                 Task::ready(Ok(()))
             }
-        } else {
-            Task::ready(Ok(()))
         }
     }
 
@@ -487,7 +490,7 @@ impl ActiveCall {
 pub fn report_call_event_for_room(
     operation: &'static str,
     room_id: u64,
-    channel_id: Option<u64>,
+    channel_id: Option<ChannelId>,
     client: &Arc<Client>,
 ) {
     let telemetry = client.telemetry();
@@ -497,7 +500,7 @@ pub fn report_call_event_for_room(
 
 pub fn report_call_event_for_channel(
     operation: &'static str,
-    channel_id: u64,
+    channel_id: ChannelId,
     client: &Arc<Client>,
     cx: &AppContext,
 ) {

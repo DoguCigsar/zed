@@ -1,8 +1,9 @@
+use gpui::AppContext;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::Settings;
+use settings::{Settings, SettingsSources};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct EditorSettings {
     pub cursor_blink: bool,
     pub hover_popover_enabled: bool,
@@ -12,10 +13,15 @@ pub struct EditorSettings {
     pub use_on_type_format: bool,
     pub toolbar: Toolbar,
     pub scrollbar: Scrollbar,
+    pub gutter: Gutter,
     pub vertical_scroll_margin: f32,
+    pub scroll_sensitivity: f32,
     pub relative_line_numbers: bool,
     pub seed_search_query_from_cursor: SeedQuerySetting,
+    pub multi_cursor_modifier: MultiCursorModifier,
     pub redact_private_values: bool,
+    #[serde(default)]
+    pub double_click_in_multibuffer: DoubleClickInMultibuffer,
 }
 
 /// When to populate a new search's query based on the text under the cursor.
@@ -30,6 +36,18 @@ pub enum SeedQuerySetting {
     Never,
 }
 
+/// What to do when multibuffer is double clicked in some of its excerpts (parts of singleton buffers).
+#[derive(Default, Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DoubleClickInMultibuffer {
+    /// Behave as a regular buffer and select the whole word.
+    #[default]
+    Select,
+    /// Open the excerpt clicked as a new buffer in the new tab, if no `alt` modifier was pressed during double click.
+    /// Otherwise, behave as a regular buffer and select the whole word.
+    Open,
+}
+
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Toolbar {
     pub breadcrumbs: bool,
@@ -40,9 +58,17 @@ pub struct Toolbar {
 pub struct Scrollbar {
     pub show: ShowScrollbar,
     pub git_diff: bool,
-    pub selections: bool,
-    pub symbols_selections: bool,
+    pub selected_symbol: bool,
+    pub search_results: bool,
     pub diagnostics: bool,
+    pub cursors: bool,
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct Gutter {
+    pub line_numbers: bool,
+    pub code_actions: bool,
+    pub folds: bool,
 }
 
 /// When to show the scrollbar in the editor.
@@ -60,6 +86,17 @@ pub enum ShowScrollbar {
     Always,
     /// Never show the scrollbar.
     Never,
+}
+
+/// The key to use for adding multiple cursors
+///
+/// Default: alt
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MultiCursorModifier {
+    Alt,
+    #[serde(alias = "cmd", alias = "ctrl")]
+    CmdOrCtrl,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -97,11 +134,17 @@ pub struct EditorSettingsContent {
     pub toolbar: Option<ToolbarContent>,
     /// Scrollbar related settings
     pub scrollbar: Option<ScrollbarContent>,
-
+    /// Gutter related settings
+    pub gutter: Option<GutterContent>,
     /// The number of lines to keep above/below the cursor when auto-scrolling.
     ///
     /// Default: 3.
     pub vertical_scroll_margin: Option<f32>,
+    /// Scroll sensitivity multiplier. This multiplier is applied
+    /// to both the horizontal and vertical delta values while scrolling.
+    ///
+    /// Default: 1.0
+    pub scroll_sensitivity: Option<f32>,
     /// Whether the line numbers on editors gutter are relative or not.
     ///
     /// Default: false
@@ -110,13 +153,22 @@ pub struct EditorSettingsContent {
     ///
     /// Default: always
     pub seed_search_query_from_cursor: Option<SeedQuerySetting>,
-
+    /// The key to use for adding multiple cursors
+    ///
+    /// Default: alt
+    pub multi_cursor_modifier: Option<MultiCursorModifier>,
     /// Hide the values of variables in `private` files, as defined by the
     /// private_files setting. This only changes the visual representation,
     /// the values are still present in the file and can be selected / copied / pasted
     ///
     /// Default: false
     pub redact_private_values: Option<bool>,
+
+    /// What to do when multibuffer is double clicked in some of its excerpts
+    /// (parts of singleton buffers).
+    ///
+    /// Default: select
+    pub double_click_in_multibuffer: Option<DoubleClickInMultibuffer>,
 }
 
 // Toolbar related settings
@@ -133,7 +185,7 @@ pub struct ToolbarContent {
 }
 
 /// Scrollbar related settings
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct ScrollbarContent {
     /// When to show the scrollbar in the editor.
     ///
@@ -143,18 +195,39 @@ pub struct ScrollbarContent {
     ///
     /// Default: true
     pub git_diff: Option<bool>,
-    /// Whether to show buffer search result markers in the scrollbar.
+    /// Whether to show buffer search result indicators in the scrollbar.
     ///
     /// Default: true
-    pub selections: Option<bool>,
-    /// Whether to show symbols highlighted markers in the scrollbar.
+    pub search_results: Option<bool>,
+    /// Whether to show selected symbol occurrences in the scrollbar.
     ///
     /// Default: true
-    pub symbols_selections: Option<bool>,
+    pub selected_symbol: Option<bool>,
     /// Whether to show diagnostic indicators in the scrollbar.
     ///
     /// Default: true
     pub diagnostics: Option<bool>,
+    /// Whether to show cursor positions in the scrollbar.
+    ///
+    /// Default: true
+    pub cursors: Option<bool>,
+}
+
+/// Gutter related settings
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct GutterContent {
+    /// Whether to show line numbers in the gutter.
+    ///
+    /// Default: true
+    pub line_numbers: Option<bool>,
+    /// Whether to show code action buttons in the gutter.
+    ///
+    /// Default: true
+    pub code_actions: Option<bool>,
+    /// Whether to show fold buttons in the gutter.
+    ///
+    /// Default: true
+    pub folds: Option<bool>,
 }
 
 impl Settings for EditorSettings {
@@ -163,10 +236,9 @@ impl Settings for EditorSettings {
     type FileContent = EditorSettingsContent;
 
     fn load(
-        default_value: &Self::FileContent,
-        user_values: &[&Self::FileContent],
-        _: &mut gpui::AppContext,
+        sources: SettingsSources<Self::FileContent>,
+        _: &mut AppContext,
     ) -> anyhow::Result<Self> {
-        Self::load_via_json_merge(default_value, user_values)
+        sources.json_merge()
     }
 }

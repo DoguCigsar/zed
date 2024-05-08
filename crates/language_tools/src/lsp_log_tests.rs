@@ -5,7 +5,9 @@ use crate::lsp_log::LogMenuItem;
 use super::*;
 use futures::StreamExt;
 use gpui::{Context, TestAppContext, VisualTestContext};
-use language::{tree_sitter_rust, FakeLspAdapter, Language, LanguageConfig, LanguageServerName};
+use language::{
+    tree_sitter_rust, FakeLspAdapter, Language, LanguageConfig, LanguageMatcher, LanguageServerName,
+};
 use project::{FakeFs, Project};
 use serde_json::json;
 use settings::SettingsStore;
@@ -18,21 +20,6 @@ async fn test_lsp_logs(cx: &mut TestAppContext) {
 
     init_test(cx);
 
-    let mut rust_language = Language::new(
-        LanguageConfig {
-            name: "Rust".into(),
-            path_suffixes: vec!["rs".to_string()],
-            ..Default::default()
-        },
-        Some(tree_sitter_rust::language()),
-    );
-    let mut fake_rust_servers = rust_language
-        .set_fake_lsp_adapter(Arc::new(FakeLspAdapter {
-            name: "the-rust-language-server",
-            ..Default::default()
-        }))
-        .await;
-
     let fs = FakeFs::new(cx.background_executor.clone());
     fs.insert_tree(
         "/the-root",
@@ -42,10 +29,28 @@ async fn test_lsp_logs(cx: &mut TestAppContext) {
         }),
     )
     .await;
+
     let project = Project::test(fs.clone(), ["/the-root".as_ref()], cx).await;
-    project.update(cx, |project, _| {
-        project.languages().add(Arc::new(rust_language));
-    });
+
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    language_registry.add(Arc::new(Language::new(
+        LanguageConfig {
+            name: "Rust".into(),
+            matcher: LanguageMatcher {
+                path_suffixes: vec!["rs".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Some(tree_sitter_rust::language()),
+    )));
+    let mut fake_rust_servers = language_registry.register_fake_lsp_adapter(
+        "Rust",
+        FakeLspAdapter {
+            name: "the-rust-language-server",
+            ..Default::default()
+        },
+    );
 
     let log_store = cx.new_model(|cx| LogStore::new(cx));
     log_store.update(cx, |store, cx| store.add_project(&project, cx));

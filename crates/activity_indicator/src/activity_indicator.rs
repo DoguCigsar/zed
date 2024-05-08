@@ -1,17 +1,17 @@
 use auto_update::{AutoUpdateStatus, AutoUpdater, DismissErrorMessage};
 use editor::Editor;
+use extension::ExtensionStore;
 use futures::StreamExt;
 use gpui::{
     actions, svg, AppContext, CursorStyle, EventEmitter, InteractiveElement as _, Model,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement, Styled, View,
     ViewContext, VisualContext as _,
 };
-use language::{LanguageRegistry, LanguageServerBinaryStatus};
+use language::{LanguageRegistry, LanguageServerBinaryStatus, LanguageServerName};
 use project::{LanguageServerProgress, Project};
 use smallvec::SmallVec;
 use std::{cmp::Reverse, fmt::Write, sync::Arc};
 use ui::prelude::*;
-use util::ResultExt;
 use workspace::{item::ItemHandle, StatusItemView, Workspace};
 
 actions!(activity_indicator, [ShowErrorMessage]);
@@ -30,7 +30,7 @@ pub struct ActivityIndicator {
 }
 
 struct LspStatus {
-    name: Arc<str>,
+    name: LanguageServerName,
     status: LanguageServerBinaryStatus,
 }
 
@@ -58,13 +58,10 @@ impl ActivityIndicator {
         let this = cx.new_view(|cx: &mut ViewContext<Self>| {
             let mut status_events = languages.language_server_binary_statuses();
             cx.spawn(|this, mut cx| async move {
-                while let Some((language, event)) = status_events.next().await {
+                while let Some((name, status)) = status_events.next().await {
                     this.update(&mut cx, |this, cx| {
-                        this.statuses.retain(|s| s.name != language.name());
-                        this.statuses.push(LspStatus {
-                            name: language.name(),
-                            status: event,
-                        });
+                        this.statuses.retain(|s| s.name != name);
+                        this.statuses.push(LspStatus { name, status });
                         cx.notify();
                     })?;
                 }
@@ -84,26 +81,37 @@ impl ActivityIndicator {
             }
         });
 
-        cx.subscribe(&this, move |workspace, _, event, cx| match event {
+        cx.subscribe(&this, move |_, _, event, cx| match event {
             Event::ShowError { lsp_name, error } => {
-                if let Some(buffer) = project
-                    .update(cx, |project, cx| project.create_buffer(error, None, cx))
-                    .log_err()
-                {
-                    buffer.update(cx, |buffer, cx| {
+                let create_buffer = project.update(cx, |project, cx| project.create_buffer(cx));
+                let project = project.clone();
+                let error = error.clone();
+                let lsp_name = lsp_name.clone();
+                cx.spawn(|workspace, mut cx| async move {
+                    let buffer = create_buffer.await?;
+                    buffer.update(&mut cx, |buffer, cx| {
                         buffer.edit(
-                            [(0..0, format!("Language server error: {}\n\n", lsp_name))],
+                            [(
+                                0..0,
+                                format!("Language server error: {}\n\n{}", lsp_name, error),
+                            )],
                             None,
                             cx,
                         );
-                    });
-                    workspace.add_item(
-                        Box::new(
-                            cx.new_view(|cx| Editor::for_buffer(buffer, Some(project.clone()), cx)),
-                        ),
-                        cx,
-                    );
-                }
+                    })?;
+                    workspace.update(&mut cx, |workspace, cx| {
+                        workspace.add_item_to_active_pane(
+                            Box::new(cx.new_view(|cx| {
+                                Editor::for_buffer(buffer, Some(project.clone()), cx)
+                            })),
+                            None,
+                            cx,
+                        );
+                    })?;
+
+                    anyhow::Ok(())
+                })
+                .detach();
             }
         })
         .detach();
@@ -114,7 +122,7 @@ impl ActivityIndicator {
         self.statuses.retain(|status| {
             if let LanguageServerBinaryStatus::Failed { error } = &status.status {
                 cx.emit(Event::ShowError {
-                    lsp_name: status.name.clone(),
+                    lsp_name: status.name.0.clone(),
                     error: error.clone(),
                 });
                 false
@@ -202,49 +210,55 @@ impl ActivityIndicator {
         let mut checking_for_update = SmallVec::<[_; 3]>::new();
         let mut failed = SmallVec::<[_; 3]>::new();
         for status in &self.statuses {
-            let name = status.name.clone();
             match status.status {
-                LanguageServerBinaryStatus::CheckingForUpdate => checking_for_update.push(name),
-                LanguageServerBinaryStatus::Downloading => downloading.push(name),
-                LanguageServerBinaryStatus::Failed { .. } => failed.push(name),
-                LanguageServerBinaryStatus::Downloaded | LanguageServerBinaryStatus::Cached => {}
+                LanguageServerBinaryStatus::CheckingForUpdate => {
+                    checking_for_update.push(status.name.0.as_ref())
+                }
+                LanguageServerBinaryStatus::Downloading => downloading.push(status.name.0.as_ref()),
+                LanguageServerBinaryStatus::Failed { .. } => failed.push(status.name.0.as_ref()),
+                LanguageServerBinaryStatus::None => {}
             }
         }
 
         if !downloading.is_empty() {
             return Content {
                 icon: Some(DOWNLOAD_ICON),
-                message: format!(
-                    "Downloading {} language server{}...",
-                    downloading.join(", "),
-                    if downloading.len() > 1 { "s" } else { "" }
-                ),
+                message: format!("Downloading {}...", downloading.join(", "),),
                 on_click: None,
             };
-        } else if !checking_for_update.is_empty() {
+        }
+
+        if !checking_for_update.is_empty() {
             return Content {
                 icon: Some(DOWNLOAD_ICON),
                 message: format!(
-                    "Checking for updates to {} language server{}...",
+                    "Checking for updates to {}...",
                     checking_for_update.join(", "),
-                    if checking_for_update.len() > 1 {
-                        "s"
-                    } else {
-                        ""
-                    }
                 ),
                 on_click: None,
             };
-        } else if !failed.is_empty() {
+        }
+
+        if !failed.is_empty() {
             return Content {
                 icon: Some(WARNING_ICON),
                 message: format!(
-                    "Failed to download {} language server{}. Click to show error.",
+                    "Failed to download {}. Click to show error.",
                     failed.join(", "),
-                    if failed.len() > 1 { "s" } else { "" }
                 ),
                 on_click: Some(Arc::new(|this, cx| {
                     this.show_error_message(&Default::default(), cx)
+                })),
+            };
+        }
+
+        // Show any formatting failure
+        if let Some(failure) = self.project.read(cx).last_formatting_failure() {
+            return Content {
+                icon: Some(WARNING_ICON),
+                message: format!("Formatting failed: {}. Click to see logs.", failure),
+                on_click: Some(Arc::new(|_, cx| {
+                    cx.dispatch_action(Box::new(workspace::OpenLog));
                 })),
             };
         }
@@ -267,11 +281,14 @@ impl ActivityIndicator {
                     message: "Installing Zed update…".to_string(),
                     on_click: None,
                 },
-                AutoUpdateStatus::Updated => Content {
+                AutoUpdateStatus::Updated { binary_path } => Content {
                     icon: None,
                     message: "Click to restart and update Zed".to_string(),
-                    on_click: Some(Arc::new(|_, cx| {
-                        workspace::restart(&Default::default(), cx)
+                    on_click: Some(Arc::new({
+                        let restart = workspace::Restart {
+                            binary_path: Some(binary_path.clone()),
+                        };
+                        move |_, cx| workspace::restart(&restart, cx)
                     })),
                 },
                 AutoUpdateStatus::Errored => Content {
@@ -283,6 +300,18 @@ impl ActivityIndicator {
                 },
                 AutoUpdateStatus::Idle => Default::default(),
             };
+        }
+
+        if let Some(extension_store) =
+            ExtensionStore::try_global(cx).map(|extension_store| extension_store.read(cx))
+        {
+            if let Some(extension_id) = extension_store.outstanding_operations().keys().next() {
+                return Content {
+                    icon: Some(DOWNLOAD_ICON),
+                    message: format!("Updating {extension_id} extension…"),
+                    on_click: None,
+                };
+            }
         }
 
         Default::default()

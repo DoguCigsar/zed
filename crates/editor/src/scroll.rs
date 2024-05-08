@@ -45,11 +45,11 @@ impl ScrollAnchor {
 
     pub fn scroll_position(&self, snapshot: &DisplaySnapshot) -> gpui::Point<f32> {
         let mut scroll_position = self.offset;
-        if self.anchor != Anchor::min() {
+        if self.anchor == Anchor::min() {
+            scroll_position.y = 0.;
+        } else {
             let scroll_top = self.anchor.to_display_point(snapshot).row() as f32;
             scroll_position.y = scroll_top + scroll_position.y;
-        } else {
-            scroll_position.y = 0.;
         }
         scroll_position
     }
@@ -137,6 +137,7 @@ pub struct ScrollManager {
     hide_scrollbar_task: Option<Task<()>>,
     dragging_scrollbar: bool,
     visible_line_count: Option<f32>,
+    forbid_vertical_scroll: bool,
 }
 
 impl ScrollManager {
@@ -151,6 +152,7 @@ impl ScrollManager {
             dragging_scrollbar: false,
             last_autoscroll: None,
             visible_line_count: None,
+            forbid_vertical_scroll: false,
         }
     }
 
@@ -182,9 +184,12 @@ impl ScrollManager {
         map: &DisplaySnapshot,
         local: bool,
         autoscroll: bool,
-        workspace_id: Option<i64>,
+        workspace_id: Option<WorkspaceId>,
         cx: &mut ViewContext<Editor>,
     ) {
+        if self.forbid_vertical_scroll {
+            return;
+        }
         let (new_anchor, top_row) = if scroll_position.y <= 0. {
             (
                 ScrollAnchor {
@@ -221,9 +226,12 @@ impl ScrollManager {
         top_row: u32,
         local: bool,
         autoscroll: bool,
-        workspace_id: Option<i64>,
+        workspace_id: Option<WorkspaceId>,
         cx: &mut ViewContext<Editor>,
     ) {
+        if self.forbid_vertical_scroll {
+            return;
+        }
         self.anchor = anchor;
         cx.emit(EditorEvent::ScrollPositionChanged { local, autoscroll });
         self.show_scrollbar(cx);
@@ -275,7 +283,7 @@ impl ScrollManager {
         self.show_scrollbars
     }
 
-    pub fn has_autoscroll_request(&self) -> bool {
+    pub fn autoscroll_requested(&self) -> bool {
         self.autoscroll_request.is_some()
     }
 
@@ -297,6 +305,14 @@ impl ScrollManager {
         } else {
             false
         }
+    }
+
+    pub fn set_forbid_vertical_scroll(&mut self, forbid: bool) {
+        self.forbid_vertical_scroll = forbid;
+    }
+
+    pub fn forbid_vertical_scroll(&self) -> bool {
+        self.forbid_vertical_scroll
     }
 }
 
@@ -334,6 +350,9 @@ impl Editor {
         scroll_delta: gpui::Point<f32>,
         cx: &mut ViewContext<Self>,
     ) {
+        if self.scroll_manager.forbid_vertical_scroll {
+            return;
+        }
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
         let position = self.scroll_manager.anchor.scroll_position(&display_map) + scroll_delta;
         self.set_scroll_position_taking_display_map(position, true, false, display_map, cx);
@@ -344,6 +363,9 @@ impl Editor {
         scroll_position: gpui::Point<f32>,
         cx: &mut ViewContext<Self>,
     ) {
+        if self.scroll_manager.forbid_vertical_scroll {
+            return;
+        }
         self.set_scroll_position_internal(scroll_position, true, false, cx);
     }
 
@@ -470,7 +492,7 @@ impl Editor {
                 .buffer()
                 .read(cx)
                 .snapshot(cx)
-                .anchor_at(Point::new(top_row as u32, 0), Bias::Left);
+                .anchor_at(Point::new(top_row, 0), Bias::Left);
             let scroll_anchor = ScrollAnchor {
                 offset: gpui::Point::new(x, y),
                 anchor: top_anchor,

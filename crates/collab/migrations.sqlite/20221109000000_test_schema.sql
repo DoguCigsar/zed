@@ -45,11 +45,13 @@ CREATE UNIQUE INDEX "index_rooms_on_channel_id" ON "rooms" ("channel_id");
 
 CREATE TABLE "projects" (
     "id" INTEGER PRIMARY KEY AUTOINCREMENT,
-    "room_id" INTEGER REFERENCES rooms (id) ON DELETE CASCADE NOT NULL,
-    "host_user_id" INTEGER REFERENCES users (id) NOT NULL,
+    "room_id" INTEGER REFERENCES rooms (id) ON DELETE CASCADE,
+    "host_user_id" INTEGER REFERENCES users (id),
     "host_connection_id" INTEGER,
     "host_connection_server_id" INTEGER REFERENCES servers (id) ON DELETE CASCADE,
-    "unregistered" BOOLEAN NOT NULL DEFAULT FALSE
+    "unregistered" BOOLEAN NOT NULL DEFAULT FALSE,
+    "hosted_project_id" INTEGER REFERENCES hosted_projects (id),
+    "dev_server_project_id" INTEGER REFERENCES dev_server_projects(id)
 );
 CREATE INDEX "index_projects_on_host_connection_server_id" ON "projects" ("host_connection_server_id");
 CREATE INDEX "index_projects_on_host_connection_id_and_host_connection_server_id" ON "projects" ("host_connection_id", "host_connection_server_id");
@@ -163,7 +165,8 @@ CREATE TABLE "room_participants" (
     "calling_connection_id" INTEGER NOT NULL,
     "calling_connection_server_id" INTEGER REFERENCES servers (id) ON DELETE SET NULL,
     "participant_index" INTEGER,
-    "role" TEXT
+    "role" TEXT,
+    "in_call" BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE UNIQUE INDEX "index_room_participants_on_user_id" ON "room_participants" ("user_id");
 CREATE INDEX "index_room_participants_on_room_id" ON "room_participants" ("room_id");
@@ -196,7 +199,7 @@ CREATE TABLE "channels" (
     "name" VARCHAR NOT NULL,
     "created_at" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "visibility" VARCHAR NOT NULL,
-    "parent_path" TEXT,
+    "parent_path" TEXT NOT NULL,
     "requires_zed_cla" BOOLEAN NOT NULL DEFAULT FALSE
 );
 
@@ -217,7 +220,9 @@ CREATE TABLE IF NOT EXISTS "channel_messages" (
     "sender_id" INTEGER NOT NULL REFERENCES users (id),
     "body" TEXT NOT NULL,
     "sent_at" TIMESTAMP,
-    "nonce" BLOB NOT NULL
+    "edited_at" TIMESTAMP,
+    "nonce" BLOB NOT NULL,
+    "reply_to_message_id" INTEGER DEFAULT NULL
 );
 CREATE INDEX "index_channel_messages_on_channel_id" ON "channel_messages" ("channel_id");
 CREATE UNIQUE INDEX "index_channel_messages_on_sender_id_nonce" ON "channel_messages" ("sender_id", "nonce");
@@ -234,8 +239,7 @@ CREATE TABLE "channel_members" (
     "id" INTEGER PRIMARY KEY AUTOINCREMENT,
     "channel_id" INTEGER NOT NULL REFERENCES channels (id) ON DELETE CASCADE,
     "user_id" INTEGER NOT NULL REFERENCES users (id) ON DELETE CASCADE,
-    "admin" BOOLEAN NOT NULL DEFAULT false,
-    "role" VARCHAR,
+    "role" VARCHAR NOT NULL,
     "accepted" BOOLEAN NOT NULL DEFAULT false,
     "updated_at" TIMESTAMP NOT NULL DEFAULT now
 );
@@ -245,7 +249,10 @@ CREATE UNIQUE INDEX "index_channel_members_on_channel_id_and_user_id" ON "channe
 CREATE TABLE "buffers" (
     "id" INTEGER PRIMARY KEY AUTOINCREMENT,
     "channel_id" INTEGER NOT NULL REFERENCES channels (id) ON DELETE CASCADE,
-    "epoch" INTEGER NOT NULL DEFAULT 0
+    "epoch" INTEGER NOT NULL DEFAULT 0,
+    "latest_operation_epoch" INTEGER,
+    "latest_operation_replica_id" INTEGER,
+    "latest_operation_lamport_timestamp" INTEGER
 );
 
 CREATE INDEX "index_buffers_on_channel_id" ON "buffers" ("channel_id");
@@ -350,4 +357,61 @@ CREATE TABLE contributors (
     user_id INTEGER REFERENCES users(id),
     signed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id)
+);
+
+CREATE TABLE extensions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    external_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    latest_version TEXT NOT NULL,
+    total_download_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE extension_versions (
+    extension_id INTEGER REFERENCES extensions(id),
+    version TEXT NOT NULL,
+    published_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    authors TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    description TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 0,
+    wasm_api_version TEXT,
+    download_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (extension_id, version)
+);
+
+CREATE UNIQUE INDEX "index_extensions_external_id" ON "extensions" ("external_id");
+CREATE INDEX "index_extensions_total_download_count" ON "extensions" ("total_download_count");
+
+CREATE TABLE rate_buckets (
+    user_id INT NOT NULL,
+    rate_limit_name VARCHAR(255) NOT NULL,
+    token_count INT NOT NULL,
+    last_refill TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+    PRIMARY KEY (user_id, rate_limit_name),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+CREATE INDEX idx_user_id_rate_limit ON rate_buckets (user_id, rate_limit_name);
+
+CREATE TABLE hosted_projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id INTEGER NOT NULL REFERENCES channels(id),
+    name TEXT NOT NULL,
+    visibility TEXT NOT NULL,
+    deleted_at TIMESTAMP NULL
+);
+CREATE INDEX idx_hosted_projects_on_channel_id ON hosted_projects (channel_id);
+CREATE UNIQUE INDEX uix_hosted_projects_on_channel_id_and_name ON hosted_projects (channel_id, name) WHERE (deleted_at IS NULL);
+
+CREATE TABLE dev_servers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    name TEXT NOT NULL,
+    hashed_token TEXT NOT NULL
+);
+
+CREATE TABLE dev_server_projects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dev_server_id INTEGER NOT NULL REFERENCES dev_servers(id),
+    path TEXT NOT NULL
 );

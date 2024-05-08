@@ -13,12 +13,14 @@ use call::{report_call_event_for_room, ActiveCall};
 pub use collab_panel::CollabPanel;
 pub use collab_titlebar_item::CollabTitlebarItem;
 use gpui::{
-    actions, point, AppContext, GlobalPixels, Pixels, PlatformDisplay, Size, Task, WindowBounds,
-    WindowContext, WindowKind, WindowOptions,
+    actions, point, AppContext, DevicePixels, Pixels, PlatformDisplay, Size, Task,
+    WindowBackgroundAppearance, WindowBounds, WindowContext, WindowKind, WindowOptions,
 };
+use panel_settings::MessageEditorSettings;
 pub use panel_settings::{
     ChatPanelSettings, CollaborationPanelSettings, NotificationPanelSettings,
 };
+use release_channel::ReleaseChannel;
 use settings::Settings;
 use workspace::{notifications::DetachAndPromptErr, AppState};
 
@@ -31,6 +33,7 @@ pub fn init(app_state: &Arc<AppState>, cx: &mut AppContext) {
     CollaborationPanelSettings::register(cx);
     ChatPanelSettings::register(cx);
     NotificationPanelSettings::register(cx);
+    MessageEditorSettings::register(cx);
 
     vcs_menu::init(cx);
     collab_titlebar_item::init(cx);
@@ -94,14 +97,15 @@ pub fn toggle_deafen(_: &ToggleDeafen, cx: &mut AppContext) {
 fn notification_window_options(
     screen: Rc<dyn PlatformDisplay>,
     window_size: Size<Pixels>,
+    cx: &AppContext,
 ) -> WindowOptions {
-    let notification_margin_width = GlobalPixels::from(16.);
-    let notification_margin_height = GlobalPixels::from(-0.) - GlobalPixels::from(48.);
+    let notification_margin_width = DevicePixels::from(16);
+    let notification_margin_height = DevicePixels::from(-0) - DevicePixels::from(48);
 
     let screen_bounds = screen.bounds();
-    let size: Size<GlobalPixels> = window_size.into();
+    let size: Size<DevicePixels> = window_size.into();
 
-    let bounds = gpui::Bounds::<GlobalPixels> {
+    let bounds = gpui::Bounds::<DevicePixels> {
         origin: screen_bounds.upper_right()
             - point(
                 size.width + notification_margin_width,
@@ -109,14 +113,18 @@ fn notification_window_options(
             ),
         size: window_size.into(),
     };
+
+    let app_id = ReleaseChannel::global(cx).app_id();
+
     WindowOptions {
-        bounds: WindowBounds::Fixed(bounds),
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: None,
-        center: false,
         focus: false,
         show: true,
         kind: WindowKind::PopUp,
         is_movable: false,
         display_id: Some(screen.id()),
+        window_background: WindowBackgroundAppearance::default(),
+        app_id: Some(app_id.to_owned()),
     }
 }

@@ -1,7 +1,7 @@
 use crate::{
-    AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId, ForegroundExecutor,
-    Keymap, Platform, PlatformDisplay, PlatformTextSystem, Task, TestDisplay, TestWindow,
-    WindowOptions,
+    AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor, Keymap,
+    Platform, PlatformDisplay, PlatformTextSystem, Task, TestDisplay, TestWindow, WindowAppearance,
+    WindowParams,
 };
 use anyhow::{anyhow, Result};
 use collections::VecDeque;
@@ -9,10 +9,9 @@ use futures::channel::oneshot;
 use parking_lot::Mutex;
 use std::{
     cell::RefCell,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::{Rc, Weak},
     sync::Arc,
-    time::Duration,
 };
 
 /// TestPlatform implements the Platform trait for use in tests.
@@ -24,6 +23,7 @@ pub(crate) struct TestPlatform {
     active_display: Rc<dyn PlatformDisplay>,
     active_cursor: Mutex<CursorStyle>,
     current_clipboard_item: Mutex<Option<ClipboardItem>>,
+    current_primary_item: Mutex<Option<ClipboardItem>>,
     pub(crate) prompts: RefCell<TestPrompts>,
     pub opened_url: RefCell<Option<String>>,
     weak: Weak<Self>,
@@ -45,6 +45,7 @@ impl TestPlatform {
             active_display: Rc::new(TestDisplay::new()),
             active_window: Default::default(),
             current_clipboard_item: Mutex::new(None),
+            current_primary_item: Mutex::new(None),
             weak: weak.clone(),
             opened_url: Default::default(),
         })
@@ -70,6 +71,7 @@ impl TestPlatform {
             .multiple_choice
             .pop_front()
             .expect("no pending multiple choice prompt");
+        self.background_executor().set_waiting_hint(None);
         tx.send(response_ix).ok();
     }
 
@@ -77,8 +79,10 @@ impl TestPlatform {
         !self.prompts.borrow().multiple_choice.is_empty()
     }
 
-    pub(crate) fn prompt(&self) -> oneshot::Receiver<usize> {
+    pub(crate) fn prompt(&self, msg: &str, detail: Option<&str>) -> oneshot::Receiver<usize> {
         let (tx, rx) = oneshot::channel();
+        self.background_executor()
+            .set_waiting_hint(Some(format!("PROMPT: {:?} {:?}", msg, detail)));
         self.prompts.borrow_mut().multiple_choice.push_back(tx);
         rx
     }
@@ -86,7 +90,7 @@ impl TestPlatform {
     pub(crate) fn set_active_window(&self, window: Option<TestWindow>) {
         let executor = self.foreground_executor().clone();
         let previous_window = self.active_window.borrow_mut().take();
-        *self.active_window.borrow_mut() = window.clone();
+        self.active_window.borrow_mut().clone_from(&window);
 
         executor
             .spawn(async move {
@@ -120,7 +124,14 @@ impl Platform for TestPlatform {
     }
 
     fn text_system(&self) -> Arc<dyn PlatformTextSystem> {
-        Arc::new(crate::platform::mac::MacTextSystem::new())
+        #[cfg(target_os = "macos")]
+        return Arc::new(crate::platform::mac::MacTextSystem::new());
+
+        #[cfg(target_os = "linux")]
+        return Arc::new(crate::platform::cosmic_text::CosmicTextSystem::new());
+
+        #[cfg(target_os = "windows")]
+        return Arc::new(crate::platform::windows::DirectWriteTextSystem::new().unwrap());
     }
 
     fn run(&self, _on_finish_launching: Box<dyn FnOnce()>) {
@@ -129,7 +140,7 @@ impl Platform for TestPlatform {
 
     fn quit(&self) {}
 
-    fn restart(&self) {
+    fn restart(&self, _: Option<PathBuf>) {
         unimplemented!()
     }
 
@@ -153,8 +164,8 @@ impl Platform for TestPlatform {
         vec![self.active_display.clone()]
     }
 
-    fn display(&self, id: DisplayId) -> Option<std::rc::Rc<dyn crate::PlatformDisplay>> {
-        self.displays().iter().find(|d| d.id() == id).cloned()
+    fn primary_display(&self) -> Option<std::rc::Rc<dyn crate::PlatformDisplay>> {
+        Some(self.active_display.clone())
     }
 
     fn active_window(&self) -> Option<crate::AnyWindowHandle> {
@@ -167,28 +178,20 @@ impl Platform for TestPlatform {
     fn open_window(
         &self,
         handle: AnyWindowHandle,
-        options: WindowOptions,
+        params: WindowParams,
     ) -> Box<dyn crate::PlatformWindow> {
         let window = TestWindow::new(
-            options,
             handle,
+            params,
             self.weak.clone(),
             self.active_display.clone(),
         );
         Box::new(window)
     }
 
-    fn set_display_link_output_callback(
-        &self,
-        _display_id: DisplayId,
-        mut callback: Box<dyn FnMut() + Send>,
-    ) {
-        callback()
+    fn window_appearance(&self) -> WindowAppearance {
+        WindowAppearance::Light
     }
-
-    fn start_display_link(&self, _display_id: DisplayId) {}
-
-    fn stop_display_link(&self, _display_id: DisplayId) {}
 
     fn open_url(&self, url: &str) {
         *self.opened_url.borrow_mut() = Some(url.to_string())
@@ -221,21 +224,15 @@ impl Platform for TestPlatform {
         unimplemented!()
     }
 
-    fn on_become_active(&self, _callback: Box<dyn FnMut()>) {}
-
-    fn on_resign_active(&self, _callback: Box<dyn FnMut()>) {}
-
     fn on_quit(&self, _callback: Box<dyn FnMut()>) {}
 
     fn on_reopen(&self, _callback: Box<dyn FnMut()>) {
         unimplemented!()
     }
 
-    fn on_event(&self, _callback: Box<dyn FnMut(crate::PlatformInput) -> bool>) {
-        unimplemented!()
-    }
-
     fn set_menus(&self, _menus: Vec<crate::Menu>, _keymap: &Keymap) {}
+
+    fn add_recent_document(&self, _paths: &Path) {}
 
     fn on_app_menu_action(&self, _callback: Box<dyn FnMut(&dyn crate::Action)>) {}
 
@@ -275,8 +272,16 @@ impl Platform for TestPlatform {
         false
     }
 
+    fn write_to_primary(&self, item: ClipboardItem) {
+        *self.current_primary_item.lock() = Some(item);
+    }
+
     fn write_to_clipboard(&self, item: ClipboardItem) {
         *self.current_clipboard_item.lock() = Some(item);
+    }
+
+    fn read_from_primary(&self) -> Option<ClipboardItem> {
+        self.current_primary_item.lock().clone()
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
@@ -295,7 +300,7 @@ impl Platform for TestPlatform {
         Task::ready(Ok(()))
     }
 
-    fn double_click_interval(&self) -> std::time::Duration {
-        Duration::from_millis(500)
+    fn register_url_scheme(&self, _: &str) -> Task<anyhow::Result<()>> {
+        unimplemented!()
     }
 }

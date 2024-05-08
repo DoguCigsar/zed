@@ -4,8 +4,8 @@ use crate::{
     tests::{room_participants, RoomParticipants, TestServer},
 };
 use call::ActiveCall;
-use channel::{ChannelId, ChannelMembership, ChannelStore};
-use client::User;
+use channel::{ChannelMembership, ChannelStore};
+use client::{ChannelId, User};
 use futures::future::try_join_all;
 use gpui::{BackgroundExecutor, Model, SharedString, TestAppContext};
 use rpc::{
@@ -281,7 +281,7 @@ async fn test_core_channels(
         .app_state
         .db
         .rename_channel(
-            db::ChannelId::from_proto(channel_a_id),
+            db::ChannelId::from_proto(channel_a_id.0),
             UserId::from_proto(client_a.id()),
             "channel-a-renamed",
         )
@@ -1023,6 +1023,8 @@ async fn test_channel_link_notifications(
         .await
         .unwrap();
 
+    executor.run_until_parked();
+
     // the new channel shows for b and c
     assert_channels_list_shape(
         client_a.channel_store(),
@@ -1431,7 +1433,7 @@ fn assert_channels(
                 .ordered_channels()
                 .map(|(depth, channel)| ExpectedChannel {
                     depth,
-                    name: channel.name.clone().into(),
+                    name: channel.name.clone(),
                     id: channel.id,
                 })
                 .collect::<Vec<_>>()
@@ -1444,7 +1446,7 @@ fn assert_channels(
 fn assert_channels_list_shape(
     channel_store: &Model<ChannelStore>,
     cx: &TestAppContext,
-    expected_channels: &[(u64, usize)],
+    expected_channels: &[(ChannelId, usize)],
 ) {
     let actual = cx.read(|cx| {
         channel_store.read_with(cx, |store, _| {

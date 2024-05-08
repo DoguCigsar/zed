@@ -15,13 +15,14 @@ use crate::{
     motion::{self, first_non_whitespace, next_line_end, right, Motion},
     object::Object,
     state::{Mode, Operator},
+    surrounds::{check_and_move_to_valid_bracket_pair, SurroundsType},
     Vim,
 };
-use collections::HashSet;
+use collections::BTreeSet;
 use editor::scroll::Autoscroll;
-use editor::{Bias, DisplayPoint};
+use editor::Bias;
 use gpui::{actions, ViewContext, WindowContext};
-use language::SelectionGoal;
+use language::{Point, SelectionGoal};
 use log::error;
 use workspace::Workspace;
 
@@ -51,6 +52,8 @@ actions!(
         ConvertToUpperCase,
         ConvertToLowerCase,
         JoinLines,
+        Indent,
+        Outdent,
     ]
 );
 
@@ -119,13 +122,40 @@ pub(crate) fn register(workspace: &mut Workspace, cx: &mut ViewContext<Workspace
                 times -= 1;
             }
 
-            vim.update_active_editor(cx, |editor, cx| {
+            vim.update_active_editor(cx, |_, editor, cx| {
                 editor.transact(cx, |editor, cx| {
                     for _ in 0..times {
                         editor.join_lines(&Default::default(), cx)
                     }
                 })
-            })
+            });
+            if vim.state().mode.is_visual() {
+                vim.switch_mode(Mode::Normal, false, cx)
+            }
+        });
+    });
+
+    workspace.register_action(|_: &mut Workspace, _: &Indent, cx| {
+        Vim::update(cx, |vim, cx| {
+            vim.record_current_action(cx);
+            vim.update_active_editor(cx, |_, editor, cx| {
+                editor.transact(cx, |editor, cx| editor.indent(&Default::default(), cx))
+            });
+            if vim.state().mode.is_visual() {
+                vim.switch_mode(Mode::Normal, false, cx)
+            }
+        });
+    });
+
+    workspace.register_action(|_: &mut Workspace, _: &Outdent, cx| {
+        Vim::update(cx, |vim, cx| {
+            vim.record_current_action(cx);
+            vim.update_active_editor(cx, |_, editor, cx| {
+                editor.transact(cx, |editor, cx| editor.outdent(&Default::default(), cx))
+            });
+            if vim.state().mode.is_visual() {
+                vim.switch_mode(Mode::Normal, false, cx)
+            }
         });
     });
 
@@ -149,6 +179,7 @@ pub fn normal_motion(
             Some(Operator::Change) => change_motion(vim, motion, times, cx),
             Some(Operator::Delete) => delete_motion(vim, motion, times, cx),
             Some(Operator::Yank) => yank_motion(vim, motion, times, cx),
+            Some(Operator::AddSurrounds { target: None }) => {}
             Some(operator) => {
                 // Can't do anything for text objects, Ignoring
                 error!("Unexpected normal mode motion operator: {:?}", operator)
@@ -159,21 +190,40 @@ pub fn normal_motion(
 
 pub fn normal_object(object: Object, cx: &mut WindowContext) {
     Vim::update(cx, |vim, cx| {
+        let mut waiting_operator: Option<Operator> = None;
         match vim.maybe_pop_operator() {
             Some(Operator::Object { around }) => match vim.maybe_pop_operator() {
                 Some(Operator::Change) => change_object(vim, object, around, cx),
                 Some(Operator::Delete) => delete_object(vim, object, around, cx),
                 Some(Operator::Yank) => yank_object(vim, object, around, cx),
+                Some(Operator::AddSurrounds { target: None }) => {
+                    waiting_operator = Some(Operator::AddSurrounds {
+                        target: Some(SurroundsType::Object(object)),
+                    });
+                }
                 _ => {
                     // Can't do anything for namespace operators. Ignoring
                 }
             },
+            Some(Operator::DeleteSurrounds) => {
+                waiting_operator = Some(Operator::DeleteSurrounds);
+            }
+            Some(Operator::ChangeSurrounds { target: None }) => {
+                if check_and_move_to_valid_bracket_pair(vim, object, cx) {
+                    waiting_operator = Some(Operator::ChangeSurrounds {
+                        target: Some(object),
+                    });
+                }
+            }
             _ => {
-                // Can't do anything with change/delete/yank and text objects. Ignoring
+                // Can't do anything with change/delete/yank/surrounds and text objects. Ignoring
             }
         }
         vim.clear_operator(cx);
-    })
+        if let Some(operator) = waiting_operator {
+            vim.push_operator(operator, cx);
+        }
+    });
 }
 
 pub(crate) fn move_cursor(
@@ -182,7 +232,7 @@ pub(crate) fn move_cursor(
     times: Option<usize>,
     cx: &mut WindowContext,
 ) {
-    vim.update_active_editor(cx, |editor, cx| {
+    vim.update_active_editor(cx, |_, editor, cx| {
         let text_layout_details = editor.text_layout_details(cx);
         editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
             s.move_cursors_with(|map, cursor, goal| {
@@ -198,7 +248,7 @@ fn insert_after(_: &mut Workspace, _: &InsertAfter, cx: &mut ViewContext<Workspa
     Vim::update(cx, |vim, cx| {
         vim.start_recording(cx);
         vim.switch_mode(Mode::Insert, false, cx);
-        vim.update_active_editor(cx, |editor, cx| {
+        vim.update_active_editor(cx, |_, editor, cx| {
             editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
                 s.move_cursors_with(|map, cursor, _| (right(map, cursor, 1), SelectionGoal::None));
             });
@@ -221,7 +271,7 @@ fn insert_first_non_whitespace(
     Vim::update(cx, |vim, cx| {
         vim.start_recording(cx);
         vim.switch_mode(Mode::Insert, false, cx);
-        vim.update_active_editor(cx, |editor, cx| {
+        vim.update_active_editor(cx, |_, editor, cx| {
             editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
                 s.move_cursors_with(|map, cursor, _| {
                     (
@@ -238,7 +288,7 @@ fn insert_end_of_line(_: &mut Workspace, _: &InsertEndOfLine, cx: &mut ViewConte
     Vim::update(cx, |vim, cx| {
         vim.start_recording(cx);
         vim.switch_mode(Mode::Insert, false, cx);
-        vim.update_active_editor(cx, |editor, cx| {
+        vim.update_active_editor(cx, |_, editor, cx| {
             editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
                 s.move_cursors_with(|map, cursor, _| {
                     (next_line_end(map, cursor, 1), SelectionGoal::None)
@@ -252,27 +302,28 @@ fn insert_line_above(_: &mut Workspace, _: &InsertLineAbove, cx: &mut ViewContex
     Vim::update(cx, |vim, cx| {
         vim.start_recording(cx);
         vim.switch_mode(Mode::Insert, false, cx);
-        vim.update_active_editor(cx, |editor, cx| {
+        vim.update_active_editor(cx, |_, editor, cx| {
             editor.transact(cx, |editor, cx| {
-                let (map, old_selections) = editor.selections.all_display(cx);
-                let selection_start_rows: HashSet<u32> = old_selections
+                let selections = editor.selections.all::<Point>(cx);
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+
+                let selection_start_rows: BTreeSet<u32> = selections
                     .into_iter()
-                    .map(|selection| selection.start.row())
+                    .map(|selection| selection.start.row)
                     .collect();
                 let edits = selection_start_rows.into_iter().map(|row| {
-                    let (indent, _) = map.line_indent(row);
-                    let start_of_line =
-                        motion::start_of_line(&map, false, DisplayPoint::new(row, 0))
-                            .to_point(&map);
-                    let mut new_text = " ".repeat(indent as usize);
-                    new_text.push('\n');
-                    (start_of_line..start_of_line, new_text)
+                    let indent = snapshot
+                        .indent_size_for_line(row)
+                        .chars()
+                        .collect::<String>();
+                    let start_of_line = Point::new(row, 0);
+                    (start_of_line..start_of_line, indent + "\n")
                 });
                 editor.edit_with_autoindent(edits, cx);
                 editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
                     s.move_cursors_with(|map, cursor, _| {
                         let previous_line = motion::start_of_relative_buffer_row(map, cursor, -1);
-                        let insert_point = motion::end_of_line(map, false, previous_line);
+                        let insert_point = motion::end_of_line(map, false, previous_line, 1);
                         (insert_point, SelectionGoal::None)
                     });
                 });
@@ -285,23 +336,23 @@ fn insert_line_below(_: &mut Workspace, _: &InsertLineBelow, cx: &mut ViewContex
     Vim::update(cx, |vim, cx| {
         vim.start_recording(cx);
         vim.switch_mode(Mode::Insert, false, cx);
-        vim.update_active_editor(cx, |editor, cx| {
+        vim.update_active_editor(cx, |_, editor, cx| {
             let text_layout_details = editor.text_layout_details(cx);
             editor.transact(cx, |editor, cx| {
-                let (map, old_selections) = editor.selections.all_display(cx);
+                let selections = editor.selections.all::<Point>(cx);
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
 
-                let selection_end_rows: HashSet<u32> = old_selections
+                let selection_end_rows: BTreeSet<u32> = selections
                     .into_iter()
-                    .map(|selection| selection.end.row())
+                    .map(|selection| selection.end.row)
                     .collect();
                 let edits = selection_end_rows.into_iter().map(|row| {
-                    let (indent, _) = map.line_indent(row);
-                    let end_of_line =
-                        motion::end_of_line(&map, false, DisplayPoint::new(row, 0)).to_point(&map);
-
-                    let mut new_text = "\n".to_string();
-                    new_text.push_str(&" ".repeat(indent as usize));
-                    (end_of_line..end_of_line, new_text)
+                    let indent = snapshot
+                        .indent_size_for_line(row)
+                        .chars()
+                        .collect::<String>();
+                    let end_of_line = Point::new(row, snapshot.line_len(row));
+                    (end_of_line..end_of_line, "\n".to_string() + &indent)
                 });
                 editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
                     s.maybe_move_cursors_with(|map, cursor, goal| {
@@ -330,7 +381,7 @@ fn yank_line(_: &mut Workspace, _: &YankLine, cx: &mut ViewContext<Workspace>) {
 pub(crate) fn normal_replace(text: Arc<str>, cx: &mut WindowContext) {
     Vim::update(cx, |vim, cx| {
         vim.stop_recording();
-        vim.update_active_editor(cx, |editor, cx| {
+        vim.update_active_editor(cx, |_, editor, cx| {
             editor.transact(cx, |editor, cx| {
                 editor.set_clip_at_line_ends(false, cx);
                 let (map, display_selections) = editor.selections.all_display(cx);
@@ -377,12 +428,15 @@ pub(crate) fn normal_replace(text: Arc<str>, cx: &mut WindowContext) {
 
 #[cfg(test)]
 mod test {
-    use gpui::TestAppContext;
+    use gpui::{KeyBinding, TestAppContext};
     use indoc::indoc;
+    use settings::SettingsStore;
 
     use crate::{
+        motion,
         state::Mode::{self},
-        test::NeovimBackedTestContext,
+        test::{NeovimBackedTestContext, VimTestContext},
+        VimSettings,
     };
 
     #[gpui::test]
@@ -904,11 +958,224 @@ mod test {
     }
 
     #[gpui::test]
+    async fn test_f_and_t_multiline(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings::<VimSettings>(cx, |s| {
+                s.use_multiline_find = Some(true);
+            });
+        });
+
+        cx.assert_binding(
+            ["f", "l"],
+            indoc! {"
+            ˇfunction print() {
+                console.log('ok')
+            }
+            "},
+            Mode::Normal,
+            indoc! {"
+            function print() {
+                consoˇle.log('ok')
+            }
+            "},
+            Mode::Normal,
+        );
+
+        cx.assert_binding(
+            ["t", "l"],
+            indoc! {"
+            ˇfunction print() {
+                console.log('ok')
+            }
+            "},
+            Mode::Normal,
+            indoc! {"
+            function print() {
+                consˇole.log('ok')
+            }
+            "},
+            Mode::Normal,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_capital_f_and_capital_t_multiline(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings::<VimSettings>(cx, |s| {
+                s.use_multiline_find = Some(true);
+            });
+        });
+
+        cx.assert_binding(
+            ["shift-f", "p"],
+            indoc! {"
+            function print() {
+                console.ˇlog('ok')
+            }
+            "},
+            Mode::Normal,
+            indoc! {"
+            function ˇprint() {
+                console.log('ok')
+            }
+            "},
+            Mode::Normal,
+        );
+
+        cx.assert_binding(
+            ["shift-t", "p"],
+            indoc! {"
+            function print() {
+                console.ˇlog('ok')
+            }
+            "},
+            Mode::Normal,
+            indoc! {"
+            function pˇrint() {
+                console.log('ok')
+            }
+            "},
+            Mode::Normal,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_f_and_t_smartcase(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings::<VimSettings>(cx, |s| {
+                s.use_smartcase_find = Some(true);
+            });
+        });
+
+        cx.assert_binding(
+            ["f", "p"],
+            indoc! {"ˇfmt.Println(\"Hello, World!\")"},
+            Mode::Normal,
+            indoc! {"fmt.ˇPrintln(\"Hello, World!\")"},
+            Mode::Normal,
+        );
+
+        cx.assert_binding(
+            ["shift-f", "p"],
+            indoc! {"fmt.Printlnˇ(\"Hello, World!\")"},
+            Mode::Normal,
+            indoc! {"fmt.ˇPrintln(\"Hello, World!\")"},
+            Mode::Normal,
+        );
+
+        cx.assert_binding(
+            ["t", "p"],
+            indoc! {"ˇfmt.Println(\"Hello, World!\")"},
+            Mode::Normal,
+            indoc! {"fmtˇ.Println(\"Hello, World!\")"},
+            Mode::Normal,
+        );
+
+        cx.assert_binding(
+            ["shift-t", "p"],
+            indoc! {"fmt.Printlnˇ(\"Hello, World!\")"},
+            Mode::Normal,
+            indoc! {"fmt.Pˇrintln(\"Hello, World!\")"},
+            Mode::Normal,
+        );
+    }
+
+    #[gpui::test]
     async fn test_percent(cx: &mut TestAppContext) {
         let mut cx = NeovimBackedTestContext::new(cx).await.binding(["%"]);
         cx.assert_all("ˇconsole.logˇ(ˇvaˇrˇ)ˇ;").await;
         cx.assert_all("ˇconsole.logˇ(ˇ'var', ˇ[ˇ1, ˇ2, 3ˇ]ˇ)ˇ;")
             .await;
         cx.assert_all("let result = curried_funˇ(ˇ)ˇ(ˇ)ˇ;").await;
+    }
+
+    #[gpui::test]
+    async fn test_end_of_line_with_neovim(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // goes to current line end
+        cx.set_shared_state(indoc! {"ˇaa\nbb\ncc"}).await;
+        cx.simulate_shared_keystrokes(["$"]).await;
+        cx.assert_shared_state(indoc! {"aˇa\nbb\ncc"}).await;
+
+        // goes to next line end
+        cx.simulate_shared_keystrokes(["2", "$"]).await;
+        cx.assert_shared_state("aa\nbˇb\ncc").await;
+
+        // try to exceed the final line.
+        cx.simulate_shared_keystrokes(["4", "$"]).await;
+        cx.assert_shared_state("aa\nbb\ncˇc").await;
+    }
+
+    #[gpui::test]
+    async fn test_subword_motions(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.update(|cx| {
+            cx.bind_keys(vec![
+                KeyBinding::new(
+                    "w",
+                    motion::NextSubwordStart {
+                        ignore_punctuation: false,
+                    },
+                    Some("Editor && VimControl && !VimWaiting && !menu"),
+                ),
+                KeyBinding::new(
+                    "b",
+                    motion::PreviousSubwordStart {
+                        ignore_punctuation: false,
+                    },
+                    Some("Editor && VimControl && !VimWaiting && !menu"),
+                ),
+                KeyBinding::new(
+                    "e",
+                    motion::NextSubwordEnd {
+                        ignore_punctuation: false,
+                    },
+                    Some("Editor && VimControl && !VimWaiting && !menu"),
+                ),
+                KeyBinding::new(
+                    "g e",
+                    motion::PreviousSubwordEnd {
+                        ignore_punctuation: false,
+                    },
+                    Some("Editor && VimControl && !VimWaiting && !menu"),
+                ),
+            ]);
+        });
+
+        cx.assert_binding_normal(
+            ["w"],
+            indoc! {"ˇassert_binding"},
+            indoc! {"assert_ˇbinding"},
+        );
+        // Special case: In 'cw', 'w' acts like 'e'
+        cx.assert_binding(
+            ["c", "w"],
+            indoc! {"ˇassert_binding"},
+            Mode::Normal,
+            indoc! {"ˇ_binding"},
+            Mode::Insert,
+        );
+
+        cx.assert_binding_normal(
+            ["e"],
+            indoc! {"ˇassert_binding"},
+            indoc! {"asserˇt_binding"},
+        );
+
+        cx.assert_binding_normal(
+            ["b"],
+            indoc! {"assert_ˇbinding"},
+            indoc! {"ˇassert_binding"},
+        );
+
+        cx.assert_binding_normal(
+            ["g", "e"],
+            indoc! {"assert_bindinˇg"},
+            indoc! {"asserˇt_binding"},
+        );
     }
 }

@@ -1,5 +1,4 @@
 use gpui::{div, Element, Render, Subscription, ViewContext};
-use settings::SettingsStore;
 use workspace::{item::ItemHandle, ui::prelude::*, StatusItemView};
 
 use crate::{state::Mode, Vim};
@@ -7,20 +6,18 @@ use crate::{state::Mode, Vim};
 /// The ModeIndicator displays the current mode in the status bar.
 pub struct ModeIndicator {
     pub(crate) mode: Option<Mode>,
-    _subscriptions: Vec<Subscription>,
+    pub(crate) operators: String,
+    _subscription: Subscription,
 }
 
 impl ModeIndicator {
     /// Construct a new mode indicator in this window.
     pub fn new(cx: &mut ViewContext<Self>) -> Self {
-        let _subscriptions = vec![
-            cx.observe_global::<Vim>(|this, cx| this.update_mode(cx)),
-            cx.observe_global::<SettingsStore>(|this, cx| this.update_mode(cx)),
-        ];
-
+        let _subscription = cx.observe_global::<Vim>(|this, cx| this.update_mode(cx));
         let mut this = Self {
             mode: None,
-            _subscriptions,
+            operators: "".to_string(),
+            _subscription,
         };
         this.update_mode(cx);
         this
@@ -34,9 +31,19 @@ impl ModeIndicator {
 
         if vim.enabled {
             self.mode = Some(vim.state().mode);
+            self.operators = self.current_operators_description(&vim);
         } else {
             self.mode = None;
         }
+    }
+
+    fn current_operators_description(&self, vim: &Vim) -> String {
+        vim.state()
+            .operator_stack
+            .iter()
+            .map(|item| item.id())
+            .collect::<Vec<_>>()
+            .join("")
     }
 }
 
@@ -46,14 +53,10 @@ impl Render for ModeIndicator {
             return div().into_any();
         };
 
-        let text = match mode {
-            Mode::Normal => "-- NORMAL --",
-            Mode::Insert => "-- INSERT --",
-            Mode::Visual => "-- VISUAL --",
-            Mode::VisualLine => "-- VISUAL LINE --",
-            Mode::VisualBlock => "-- VISUAL BLOCK --",
-        };
-        Label::new(text).size(LabelSize::Small).into_any_element()
+        Label::new(format!("{} -- {} --", self.operators, mode))
+            .size(LabelSize::Small)
+            .line_height_style(LineHeightStyle::UiLabel)
+            .into_any_element()
     }
 }
 

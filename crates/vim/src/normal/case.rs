@@ -40,7 +40,7 @@ where
     Vim::update(cx, |vim, cx| {
         vim.record_current_action(cx);
         let count = vim.take_count(cx).unwrap_or(1) as u32;
-        vim.update_active_editor(cx, |editor, cx| {
+        vim.update_active_editor(cx, |vim, editor, cx| {
             let mut ranges = Vec::new();
             let mut cursor_positions = Vec::new();
             let snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -63,7 +63,7 @@ where
                             cursor_positions.push(selection.start..selection.start);
                         }
                     }
-                    Mode::Insert | Mode::Normal => {
+                    Mode::Insert | Mode::Normal | Mode::Replace => {
                         let start = selection.start;
                         let mut end = start;
                         for _ in 0..count {

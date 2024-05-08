@@ -1,9 +1,12 @@
-use std::{cmp, f32};
+use std::{any::TypeId, cmp, f32};
 
-use gpui::{px, Pixels, ViewContext};
+use collections::HashSet;
+use gpui::{px, Bounds, Pixels, ViewContext};
 use language::Point;
 
-use crate::{display_map::ToDisplayPoint, Editor, EditorMode, LineWithInvisibles};
+use crate::{
+    display_map::ToDisplayPoint, DiffRowHighlight, Editor, EditorMode, LineWithInvisibles,
+};
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Autoscroll {
@@ -32,6 +35,10 @@ impl Autoscroll {
     pub fn focused() -> Self {
         Self::Strategy(AutoscrollStrategy::Focused)
     }
+    /// Scrolls so that the newest cursor is roughly an n-th line from the top.
+    pub fn top_relative(n: usize) -> Self {
+        Self::Strategy(AutoscrollStrategy::TopRelative(n))
+    }
 }
 
 #[derive(PartialEq, Eq, Default, Clone, Copy)]
@@ -43,6 +50,7 @@ pub enum AutoscrollStrategy {
     Focused,
     Top,
     Bottom,
+    TopRelative(usize),
 }
 
 impl AutoscrollStrategy {
@@ -56,15 +64,29 @@ impl AutoscrollStrategy {
 }
 
 impl Editor {
+    pub fn autoscroll_requested(&self) -> bool {
+        self.scroll_manager.autoscroll_requested()
+    }
+
     pub fn autoscroll_vertically(
         &mut self,
-        viewport_height: Pixels,
+        bounds: Bounds<Pixels>,
         line_height: Pixels,
         cx: &mut ViewContext<Editor>,
     ) -> bool {
-        let visible_lines = f32::from(viewport_height / line_height);
+        let viewport_height = bounds.size.height;
+        let visible_lines = viewport_height / line_height;
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
         let mut scroll_position = self.scroll_manager.scroll_position(&display_map);
+        let original_y = scroll_position.y;
+        if let Some(last_bounds) = self.expect_bounds_change.take() {
+            if scroll_position.y != 0. {
+                scroll_position.y += (bounds.top() - last_bounds.top()) / line_height;
+                if scroll_position.y < 0. {
+                    scroll_position.y = 0.;
+                }
+            }
+        }
         let max_scroll_top = if matches!(self.mode, EditorMode::AutoHeight { .. }) {
             (display_map.max_point().row() as f32 - visible_lines + 1.).max(0.)
         } else {
@@ -72,6 +94,9 @@ impl Editor {
         };
         if scroll_position.y > max_scroll_top {
             scroll_position.y = max_scroll_top;
+        }
+
+        if original_y != scroll_position.y {
             self.set_scroll_position(scroll_position, cx);
         }
 
@@ -81,8 +106,14 @@ impl Editor {
 
         let mut target_top;
         let mut target_bottom;
-        if let Some(highlighted_rows) = &self.highlighted_rows {
-            target_top = highlighted_rows.start as f32;
+        if let Some(first_highlighted_row) = &self
+            .highlighted_display_rows(
+                HashSet::from_iter(Some(TypeId::of::<DiffRowHighlight>())),
+                cx,
+            )
+            .first_entry()
+        {
+            target_top = *first_highlighted_row.key() as f32;
             target_bottom = target_top + 1.;
         } else {
             let selections = self.selections.all::<Point>(cx);
@@ -178,6 +209,10 @@ impl Editor {
                 scroll_position.y = (target_bottom - visible_lines).max(0.0);
                 self.set_scroll_position_internal(scroll_position, local, true, cx);
             }
+            AutoscrollStrategy::TopRelative(lines) => {
+                scroll_position.y = target_top - lines as f32;
+                self.set_scroll_position_internal(scroll_position, local, true, cx);
+            }
         }
 
         self.scroll_manager.last_autoscroll = Some((
@@ -205,10 +240,7 @@ impl Editor {
         let mut target_left;
         let mut target_right;
 
-        if self.highlighted_rows.is_some() {
-            target_left = px(0.);
-            target_right = px(0.);
-        } else {
+        if self.highlighted_rows.is_empty() {
             target_left = px(f32::INFINITY);
             target_right = px(0.);
             for selection in selections {
@@ -229,6 +261,9 @@ impl Editor {
                     );
                 }
             }
+        } else {
+            target_left = px(0.);
+            target_right = px(0.);
         }
 
         target_right = target_right.min(scroll_width);
@@ -241,11 +276,10 @@ impl Editor {
         let scroll_right = scroll_left + viewport_width;
 
         if target_left < scroll_left {
-            self.scroll_manager.anchor.offset.x = (target_left / max_glyph_width).into();
+            self.scroll_manager.anchor.offset.x = target_left / max_glyph_width;
             true
         } else if target_right > scroll_right {
-            self.scroll_manager.anchor.offset.x =
-                ((target_right - viewport_width) / max_glyph_width).into();
+            self.scroll_manager.anchor.offset.x = (target_right - viewport_width) / max_glyph_width;
             true
         } else {
             false

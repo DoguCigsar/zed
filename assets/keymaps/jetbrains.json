@@ -11,7 +11,7 @@
       "ctrl->": "zed::IncreaseBufferFontSize",
       "ctrl-<": "zed::DecreaseBufferFontSize",
       "ctrl-shift-j": "editor::JoinLines",
-      "cmd-d": "editor::DuplicateLine",
+      "cmd-d": "editor::DuplicateLineDown",
       "cmd-backspace": "editor::DeleteLine",
       "cmd-pagedown": "editor::MovePageDown",
       "cmd-pageup": "editor::MovePageUp",
@@ -39,6 +39,8 @@
           "advance_downwards": true
         }
       ],
+      "alt-up": "editor::SelectLargerSyntaxNode",
+      "alt-down": "editor::SelectSmallerSyntaxNode",
       "shift-alt-up": "editor::MoveLineUp",
       "shift-alt-down": "editor::MoveLineDown",
       "cmd-alt-l": "editor::Format",
@@ -79,6 +81,13 @@
       "cmd-alt-o": "project_symbols::Toggle",
       "cmd-1": "workspace::ToggleLeftDock",
       "cmd-6": "diagnostics::Deploy"
+    }
+  },
+  {
+    "context": "Pane",
+    "bindings": {
+      "cmd-alt-left": "pane::GoBack",
+      "cmd-alt-right": "pane::GoForward"
     }
   },
   {

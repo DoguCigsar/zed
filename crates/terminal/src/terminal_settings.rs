@@ -1,3 +1,4 @@
+use collections::HashMap;
 use gpui::{px, AbsoluteLength, AppContext, FontFeatures, Pixels};
 use schemars::{
     gen::SchemaGenerator,
@@ -6,8 +7,8 @@ use schemars::{
 };
 use serde_derive::{Deserialize, Serialize};
 use serde_json::Value;
-use settings::SettingsJsonSchemaParams;
-use std::{collections::HashMap, path::PathBuf};
+use settings::{SettingsJsonSchemaParams, SettingsSources};
+use std::path::PathBuf;
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -15,6 +16,11 @@ pub enum TerminalDockPosition {
     Left,
     Bottom,
     Right,
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct Toolbar {
+    pub title: bool,
 }
 
 #[derive(Deserialize)]
@@ -30,10 +36,13 @@ pub struct TerminalSettings {
     pub alternate_scroll: AlternateScroll,
     pub option_as_meta: bool,
     pub copy_on_select: bool,
+    pub button: bool,
     pub dock: TerminalDockPosition,
     pub default_width: Pixels,
     pub default_height: Pixels,
     pub detect_venv: VenvSettings,
+    pub max_scroll_history_lines: Option<usize>,
+    pub toolbar: Toolbar,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -130,6 +139,10 @@ pub struct TerminalSettingsContent {
     ///
     /// Default: false
     pub copy_on_select: Option<bool>,
+    /// Whether to show the terminal button in the status bar.
+    ///
+    /// Default: true
+    pub button: Option<bool>,
     pub dock: Option<TerminalDockPosition>,
     /// Default width when the terminal is docked to the left or right.
     ///
@@ -145,6 +158,16 @@ pub struct TerminalSettingsContent {
     ///
     /// Default: on
     pub detect_venv: Option<VenvSettings>,
+    /// The maximum number of lines to keep in the scrollback history.
+    /// Maximum allowed value is 100_000, all values above that will be treated as 100_000.
+    /// 0 disables the scrolling.
+    /// Existing terminals will not pick up this change until they are recreated.
+    /// See <a href="https://github.com/alacritty/alacritty/blob/cb3a79dbf6472740daca8440d5166c1d4af5029e/extra/man/alacritty.5.scd?plain=1#L207-L213">Alacritty documentation</a> for more information.
+    ///
+    /// Default: 10_000
+    pub max_scroll_history_lines: Option<usize>,
+    /// Toolbar related settings
+    pub toolbar: Option<ToolbarContent>,
 }
 
 impl settings::Settings for TerminalSettings {
@@ -153,12 +176,12 @@ impl settings::Settings for TerminalSettings {
     type FileContent = TerminalSettingsContent;
 
     fn load(
-        default_value: &Self::FileContent,
-        user_values: &[&Self::FileContent],
+        sources: SettingsSources<Self::FileContent>,
         _: &mut AppContext,
     ) -> anyhow::Result<Self> {
-        Self::load_via_json_merge(default_value, user_values)
+        sources.json_merge()
     }
+
     fn json_schema(
         generator: &mut SchemaGenerator,
         params: &SettingsJsonSchemaParams,
@@ -263,4 +286,13 @@ pub enum WorkingDirectory {
     /// If this path is not a valid directory the terminal will default to
     /// this platform's home directory  (if it can be found).
     Always { directory: String },
+}
+
+// Toolbar related settings
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ToolbarContent {
+    /// Whether to display the terminal title in its toolbar.
+    ///
+    /// Default: true
+    pub title: Option<bool>,
 }

@@ -87,8 +87,7 @@ async fn test_get_or_create_user_by_github_account(db: &Arc<Database>) {
         },
     )
     .await
-    .unwrap()
-    .user_id;
+    .unwrap();
     let user_id2 = db
         .create_user(
             "user2@example.com",
@@ -103,7 +102,7 @@ async fn test_get_or_create_user_by_github_account(db: &Arc<Database>) {
         .user_id;
 
     let user = db
-        .get_or_create_user_by_github_account("the-new-login2", Some(102), None)
+        .get_or_create_user_by_github_account("the-new-login2", Some(102), None, None)
         .await
         .unwrap();
     assert_eq!(user.id, user_id2);
@@ -111,7 +110,7 @@ async fn test_get_or_create_user_by_github_account(db: &Arc<Database>) {
     assert_eq!(user.github_user_id, Some(102));
 
     let user = db
-        .get_or_create_user_by_github_account("login3", Some(103), Some("user3@example.com"))
+        .get_or_create_user_by_github_account("login3", Some(103), Some("user3@example.com"), None)
         .await
         .unwrap();
     assert_eq!(&user.github_login, "login3");
@@ -495,7 +494,7 @@ async fn test_project_count(db: &Arc<Database>) {
 
     let user1 = db
         .create_user(
-            &format!("admin@example.com"),
+            "admin@example.com",
             true,
             NewUserParams {
                 github_login: "admin".into(),
@@ -506,7 +505,7 @@ async fn test_project_count(db: &Arc<Database>) {
         .unwrap();
     let user2 = db
         .create_user(
-            &format!("user@example.com"),
+            "user@example.com",
             false,
             NewUserParams {
                 github_login: "user".into(),
@@ -517,7 +516,7 @@ async fn test_project_count(db: &Arc<Database>) {
         .unwrap();
 
     let room_id = RoomId::from_proto(
-        db.create_room(user1.user_id, ConnectionId { owner_id, id: 0 }, "", "test")
+        db.create_room(user1.user_id, ConnectionId { owner_id, id: 0 }, "")
             .await
             .unwrap()
             .id,
@@ -531,28 +530,23 @@ async fn test_project_count(db: &Arc<Database>) {
     )
     .await
     .unwrap();
-    db.join_room(
-        room_id,
-        user2.user_id,
-        ConnectionId { owner_id, id: 1 },
-        "test",
-    )
-    .await
-    .unwrap();
+    db.join_room(room_id, user2.user_id, ConnectionId { owner_id, id: 1 })
+        .await
+        .unwrap();
     assert_eq!(db.project_count_excluding_admins().await.unwrap(), 0);
 
-    db.share_project(room_id, ConnectionId { owner_id, id: 1 }, &[])
+    db.share_project(room_id, ConnectionId { owner_id, id: 1 }, &[], None)
         .await
         .unwrap();
     assert_eq!(db.project_count_excluding_admins().await.unwrap(), 1);
 
-    db.share_project(room_id, ConnectionId { owner_id, id: 1 }, &[])
+    db.share_project(room_id, ConnectionId { owner_id, id: 1 }, &[], None)
         .await
         .unwrap();
     assert_eq!(db.project_count_excluding_admins().await.unwrap(), 2);
 
     // Projects shared by admins aren't counted.
-    db.share_project(room_id, ConnectionId { owner_id, id: 0 }, &[])
+    db.share_project(room_id, ConnectionId { owner_id, id: 0 }, &[], None)
         .await
         .unwrap();
     assert_eq!(db.project_count_excluding_admins().await.unwrap(), 2);
@@ -615,81 +609,4 @@ async fn test_fuzzy_search_users(cx: &mut TestAppContext) {
             .map(|user| user.github_login)
             .collect::<Vec<_>>()
     }
-}
-
-test_both_dbs!(
-    test_non_matching_release_channels,
-    test_non_matching_release_channels_postgres,
-    test_non_matching_release_channels_sqlite
-);
-
-async fn test_non_matching_release_channels(db: &Arc<Database>) {
-    let owner_id = db.create_server("test").await.unwrap().0 as u32;
-
-    let user1 = db
-        .create_user(
-            &format!("admin@example.com"),
-            true,
-            NewUserParams {
-                github_login: "admin".into(),
-                github_user_id: 0,
-            },
-        )
-        .await
-        .unwrap();
-    let user2 = db
-        .create_user(
-            &format!("user@example.com"),
-            false,
-            NewUserParams {
-                github_login: "user".into(),
-                github_user_id: 1,
-            },
-        )
-        .await
-        .unwrap();
-
-    let room = db
-        .create_room(
-            user1.user_id,
-            ConnectionId { owner_id, id: 0 },
-            "",
-            "stable",
-        )
-        .await
-        .unwrap();
-
-    db.call(
-        RoomId::from_proto(room.id),
-        user1.user_id,
-        ConnectionId { owner_id, id: 0 },
-        user2.user_id,
-        None,
-    )
-    .await
-    .unwrap();
-
-    // User attempts to join from preview
-    let result = db
-        .join_room(
-            RoomId::from_proto(room.id),
-            user2.user_id,
-            ConnectionId { owner_id, id: 1 },
-            "preview",
-        )
-        .await;
-
-    assert!(result.is_err());
-
-    // User switches to stable
-    let result = db
-        .join_room(
-            RoomId::from_proto(room.id),
-            user2.user_id,
-            ConnectionId { owner_id, id: 1 },
-            "stable",
-        )
-        .await;
-
-    assert!(result.is_ok())
 }

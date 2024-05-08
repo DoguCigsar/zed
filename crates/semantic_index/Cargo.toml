@@ -1,69 +1,60 @@
 [package]
 name = "semantic_index"
+description = "Process, chunk, and embed text as vectors for semantic search."
 version = "0.1.0"
 edition = "2021"
 publish = false
 license = "GPL-3.0-or-later"
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/semantic_index.rs"
-doctest = false
+
+[[example]]
+name = "index"
+path = "examples/index.rs"
+crate-type = ["bin"]
 
 [dependencies]
-ai = { path = "../ai" }
 anyhow.workspace = true
-async-trait.workspace = true
-collections = { path = "../collections" }
+client.workspace = true
+clock.workspace = true
+collections.workspace = true
+fs.workspace = true
 futures.workspace = true
-globset.workspace = true
-gpui = { path = "../gpui" }
-language = { path = "../language" }
-lazy_static.workspace = true
+futures-batch.workspace = true
+gpui.workspace = true
+language.workspace = true
 log.workspace = true
-ndarray = { version = "0.15.0" }
-ordered-float.workspace = true
+heed.workspace = true
+open_ai.workspace = true
 parking_lot.workspace = true
-postage.workspace = true
-project = { path = "../project" }
-rand.workspace = true
-release_channel = { path = "../release_channel" }
-rpc = { path = "../rpc" }
-rusqlite.workspace = true
-schemars.workspace = true
+project.workspace = true
+settings.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-settings = { path = "../settings" }
-sha1 = "0.10.5"
+sha2.workspace = true
 smol.workspace = true
-tiktoken-rs.workspace = true
+theme.workspace = true
 tree-sitter.workspace = true
-util = { path = "../util" }
-workspace = { path = "../workspace" }
+ui. workspace = true
+util. workspace = true
+unindent.workspace = true
+workspace.workspace = true
+worktree.workspace = true
 
 [dev-dependencies]
-ai = { path = "../ai", features = ["test-support"] }
-client = { path = "../client" }
-collections = { path = "../collections", features = ["test-support"] }
-ctor.workspace = true
 env_logger.workspace = true
-gpui = { path = "../gpui", features = ["test-support"] }
-language = { path = "../language", features = ["test-support"] }
-node_runtime = { path = "../node_runtime" }
-pretty_assertions.workspace = true
-project = { path = "../project", features = ["test-support"] }
-rand.workspace = true
-rpc = { path = "../rpc", features = ["test-support"] }
-rust-embed.workspace = true
-settings = { path = "../settings", features = ["test-support"]}
+client = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
+futures.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
+languages.workspace = true
+project = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
-tree-sitter-cpp.workspace = true
-tree-sitter-elixir.workspace = true
-tree-sitter-json.workspace = true
-tree-sitter-lua.workspace = true
-tree-sitter-php.workspace = true
-tree-sitter-ruby.workspace = true
-tree-sitter-rust.workspace = true
-tree-sitter-toml.workspace = true
-tree-sitter-typescript.workspace = true
-unindent.workspace = true
-workspace = { path = "../workspace", features = ["test-support"] }
+util = { workspace = true, features = ["test-support"] }
+worktree = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }

@@ -1,11 +1,11 @@
 use super::{events::key_to_native, BoolExt};
 use crate::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
-    ForegroundExecutor, Keymap, MacDispatcher, MacDisplay, MacDisplayLinker, MacTextSystem,
-    MacWindow, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay, PlatformInput,
-    PlatformTextSystem, PlatformWindow, Result, SemanticVersion, Task, WindowOptions,
+    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
+    Keymap, MacDispatcher, MacDisplay, MacTextSystem, MacWindow, Menu, MenuItem, PathPromptOptions,
+    Platform, PlatformDisplay, PlatformTextSystem, PlatformWindow, Result, SemanticVersion, Task,
+    WindowAppearance, WindowParams,
 };
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use block::ConcreteBlock;
 use cocoa::{
     appkit::{
@@ -48,9 +48,10 @@ use std::{
     rc::Rc,
     slice, str,
     sync::Arc,
-    time::Duration,
 };
 use time::UtcOffset;
+
+use super::renderer;
 
 #[allow(non_upper_case_globals)]
 const NSUTF8StringEncoding: NSUInteger = 4;
@@ -64,10 +65,6 @@ unsafe fn build_classes() {
     APP_CLASS = {
         let mut decl = ClassDecl::new("GPUIApplication", class!(NSApplication)).unwrap();
         decl.add_ivar::<*mut c_void>(MAC_PLATFORM_IVAR);
-        decl.add_method(
-            sel!(sendEvent:),
-            send_event as extern "C" fn(&mut Object, Sel, id),
-        );
         decl.register()
     };
 
@@ -81,14 +78,6 @@ unsafe fn build_classes() {
         decl.add_method(
             sel!(applicationShouldHandleReopen:hasVisibleWindows:),
             should_handle_reopen as extern "C" fn(&mut Object, Sel, id, bool),
-        );
-        decl.add_method(
-            sel!(applicationDidBecomeActive:),
-            did_become_active as extern "C" fn(&mut Object, Sel, id),
-        );
-        decl.add_method(
-            sel!(applicationDidResignActive:),
-            did_resign_active as extern "C" fn(&mut Object, Sel, id),
         );
         decl.add_method(
             sel!(applicationWillTerminate:),
@@ -135,6 +124,7 @@ unsafe fn build_classes() {
             sel!(application:openURLs:),
             open_urls as extern "C" fn(&mut Object, Sel, id, id),
         );
+
         decl.register()
     }
 }
@@ -145,16 +135,12 @@ pub(crate) struct MacPlatformState {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<MacTextSystem>,
-    display_linker: MacDisplayLinker,
-    instance_buffer_pool: Arc<Mutex<Vec<metal::Buffer>>>,
+    renderer_context: renderer::Context,
     pasteboard: id,
     text_hash_pasteboard_type: id,
     metadata_pasteboard_type: id,
-    become_active: Option<Box<dyn FnMut()>>,
-    resign_active: Option<Box<dyn FnMut()>>,
     reopen: Option<Box<dyn FnMut()>>,
     quit: Option<Box<dyn FnMut()>>,
-    event: Option<Box<dyn FnMut(PlatformInput) -> bool>>,
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     will_open_menu: Option<Box<dyn FnMut()>>,
@@ -176,16 +162,12 @@ impl MacPlatform {
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher),
             text_system: Arc::new(MacTextSystem::new()),
-            display_linker: MacDisplayLinker::new(),
-            instance_buffer_pool: Arc::default(),
+            renderer_context: renderer::Context::default(),
             pasteboard: unsafe { NSPasteboard::generalPasteboard(nil) },
             text_hash_pasteboard_type: unsafe { ns_string("zed-text-hash") },
             metadata_pasteboard_type: unsafe { ns_string("zed-metadata") },
-            become_active: None,
-            resign_active: None,
             reopen: None,
             quit: None,
-            event: None,
             menu_command: None,
             validate_menu_command: None,
             will_open_menu: None,
@@ -279,7 +261,7 @@ impl MacPlatform {
                         let mut mask = NSEventModifierFlags::empty();
                         for (modifier, flag) in &[
                             (
-                                keystroke.modifiers.command,
+                                keystroke.modifiers.platform,
                                 NSEventModifierFlags::NSCommandKeyMask,
                             ),
                             (
@@ -414,7 +396,7 @@ impl Platform for MacPlatform {
         }
     }
 
-    fn restart(&self) {
+    fn restart(&self, _binary_path: Option<PathBuf>) {
         use std::os::unix::process::CommandExt as _;
 
         let app_pid = std::process::id().to_string();
@@ -477,14 +459,14 @@ impl Platform for MacPlatform {
         }
     }
 
+    fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
+        Some(Rc::new(MacDisplay::primary()))
+    }
+
     fn displays(&self) -> Vec<Rc<dyn PlatformDisplay>> {
         MacDisplay::all()
             .map(|screen| Rc::new(screen) as Rc<_>)
             .collect()
-    }
-
-    fn display(&self, id: DisplayId) -> Option<Rc<dyn PlatformDisplay>> {
-        MacDisplay::find_by_id(id).map(|screen| Rc::new(screen) as Rc<_>)
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
@@ -494,34 +476,25 @@ impl Platform for MacPlatform {
     fn open_window(
         &self,
         handle: AnyWindowHandle,
-        options: WindowOptions,
+        options: WindowParams,
     ) -> Box<dyn PlatformWindow> {
-        let instance_buffer_pool = self.0.lock().instance_buffer_pool.clone();
+        // Clippy thinks that this evaluates to `()`, for some reason.
+        #[allow(clippy::unit_arg, clippy::clone_on_copy)]
+        let renderer_context = self.0.lock().renderer_context.clone();
         Box::new(MacWindow::open(
             handle,
             options,
             self.foreground_executor(),
-            instance_buffer_pool,
+            renderer_context,
         ))
     }
 
-    fn set_display_link_output_callback(
-        &self,
-        display_id: DisplayId,
-        callback: Box<dyn FnMut() + Send>,
-    ) {
-        self.0
-            .lock()
-            .display_linker
-            .set_output_callback(display_id, callback);
-    }
-
-    fn start_display_link(&self, display_id: DisplayId) {
-        self.0.lock().display_linker.start(display_id);
-    }
-
-    fn stop_display_link(&self, display_id: DisplayId) {
-        self.0.lock().display_linker.stop(display_id);
+    fn window_appearance(&self) -> WindowAppearance {
+        unsafe {
+            let app = NSApplication::sharedApplication(nil);
+            let appearance: id = msg_send![app, effectiveAppearance];
+            WindowAppearance::from_native(appearance)
+        }
     }
 
     fn open_url(&self, url: &str) {
@@ -532,6 +505,55 @@ impl Platform for MacPlatform {
             let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
             msg_send![workspace, openURL: url]
         }
+    }
+
+    fn register_url_scheme(&self, scheme: &str) -> Task<anyhow::Result<()>> {
+        // API only available post Monterey
+        // https://developer.apple.com/documentation/appkit/nsworkspace/3753004-setdefaultapplicationaturl
+        let (done_tx, done_rx) = oneshot::channel();
+        if self.os_version().ok() < Some(SemanticVersion::new(12, 0, 0)) {
+            return Task::ready(Err(anyhow!(
+                "macOS 12.0 or later is required to register URL schemes"
+            )));
+        }
+
+        let bundle_id = unsafe {
+            let bundle: id = msg_send![class!(NSBundle), mainBundle];
+            let bundle_id: id = msg_send![bundle, bundleIdentifier];
+            if bundle_id == nil {
+                return Task::ready(Err(anyhow!("Can only register URL scheme in bundled apps")));
+            }
+            bundle_id
+        };
+
+        unsafe {
+            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let scheme: id = ns_string(scheme);
+            let app: id = msg_send![workspace, URLForApplicationWithBundleIdentifier: bundle_id];
+            if app == nil {
+                return Task::ready(Err(anyhow!(
+                    "Cannot register URL scheme until app is installed"
+                )));
+            }
+            let done_tx = Cell::new(Some(done_tx));
+            let block = ConcreteBlock::new(move |error: id| {
+                let result = if error == nil {
+                    Ok(())
+                } else {
+                    let msg: id = msg_send![error, localizedDescription];
+                    Err(anyhow!("Failed to register: {:?}", msg))
+                };
+
+                if let Some(done_tx) = done_tx.take() {
+                    let _ = done_tx.send(result);
+                }
+            });
+            let block = block.copy();
+            let _: () = msg_send![workspace, setDefaultApplicationAtURL: app toOpenURLsWithScheme: scheme completionHandler: block];
+        }
+
+        self.background_executor()
+            .spawn(async { crate::Flatten::flatten(done_rx.await.map_err(|e| anyhow!(e))) })
     }
 
     fn on_open_urls(&self, callback: Box<dyn FnMut(Vec<String>)>) {
@@ -635,24 +657,12 @@ impl Platform for MacPlatform {
         }
     }
 
-    fn on_become_active(&self, callback: Box<dyn FnMut()>) {
-        self.0.lock().become_active = Some(callback);
-    }
-
-    fn on_resign_active(&self, callback: Box<dyn FnMut()>) {
-        self.0.lock().resign_active = Some(callback);
-    }
-
     fn on_quit(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().quit = Some(callback);
     }
 
     fn on_reopen(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().reopen = Some(callback);
-    }
-
-    fn on_event(&self, callback: Box<dyn FnMut(PlatformInput) -> bool>) {
-        self.0.lock().event = Some(callback);
     }
 
     fn on_app_menu_action(&self, callback: Box<dyn FnMut(&dyn Action)>) {
@@ -671,22 +681,15 @@ impl Platform for MacPlatform {
         "macOS"
     }
 
-    fn double_click_interval(&self) -> Duration {
-        unsafe {
-            let double_click_interval: f64 = msg_send![class!(NSEvent), doubleClickInterval];
-            Duration::from_secs_f64(double_click_interval)
-        }
-    }
-
     fn os_version(&self) -> Result<SemanticVersion> {
         unsafe {
             let process_info = NSProcessInfo::processInfo(nil);
             let version = process_info.operatingSystemVersion();
-            Ok(SemanticVersion {
-                major: version.majorVersion as usize,
-                minor: version.minorVersion as usize,
-                patch: version.patchVersion as usize,
-            })
+            Ok(SemanticVersion::new(
+                version.majorVersion as usize,
+                version.minorVersion as usize,
+                version.patchVersion as usize,
+            ))
         }
     }
 
@@ -697,6 +700,9 @@ impl Platform for MacPlatform {
                 Err(anyhow!("app is not running inside a bundle"))
             } else {
                 let version: id = msg_send![bundle, objectForInfoDictionaryKey: ns_string("CFBundleShortVersionString")];
+                if version.is_null() {
+                    bail!("bundle does not have version");
+                }
                 let len = msg_send![version, lengthOfBytesUsingEncoding: NSUTF8StringEncoding];
                 let bytes = version.UTF8String() as *const u8;
                 let version = str::from_utf8(slice::from_raw_parts(bytes, len)).unwrap();
@@ -722,6 +728,17 @@ impl Platform for MacPlatform {
             let mut state = self.0.lock();
             let actions = &mut state.menu_actions;
             app.setMainMenu_(self.create_menu_bar(menus, app.delegate(), actions, keymap));
+        }
+    }
+
+    fn add_recent_document(&self, path: &Path) {
+        if let Some(path_str) = path.to_str() {
+            unsafe {
+                let document_controller: id =
+                    msg_send![class!(NSDocumentController), sharedDocumentController];
+                let url: id = NSURL::fileURLWithPath_(nil, ns_string(path_str));
+                let _: () = msg_send![document_controller, noteNewRecentDocumentURL:url];
+            }
         }
     }
 
@@ -764,9 +781,11 @@ impl Platform for MacPlatform {
                 CursorStyle::ResizeLeft => msg_send![class!(NSCursor), resizeLeftCursor],
                 CursorStyle::ResizeRight => msg_send![class!(NSCursor), resizeRightCursor],
                 CursorStyle::ResizeLeftRight => msg_send![class!(NSCursor), resizeLeftRightCursor],
+                CursorStyle::ResizeColumn => msg_send![class!(NSCursor), resizeLeftRightCursor],
                 CursorStyle::ResizeUp => msg_send![class!(NSCursor), resizeUpCursor],
                 CursorStyle::ResizeDown => msg_send![class!(NSCursor), resizeDownCursor],
                 CursorStyle::ResizeUpDown => msg_send![class!(NSCursor), resizeUpDownCursor],
+                CursorStyle::ResizeRow => msg_send![class!(NSCursor), resizeUpDownCursor],
                 CursorStyle::DisappearingItem => {
                     msg_send![class!(NSCursor), disappearingItemCursor]
                 }
@@ -797,6 +816,8 @@ impl Platform for MacPlatform {
             style == NSScrollerStyleOverlay
         }
     }
+
+    fn write_to_primary(&self, _item: ClipboardItem) {}
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
         let state = self.0.lock();
@@ -833,6 +854,10 @@ impl Platform for MacPlatform {
                     .setData_forType(metadata_bytes, state.metadata_pasteboard_type);
             }
         }
+    }
+
+    fn read_from_primary(&self) -> Option<ClipboardItem> {
+        None
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
@@ -999,29 +1024,10 @@ unsafe fn get_mac_platform(object: &mut Object) -> &MacPlatform {
     &*(platform_ptr as *const MacPlatform)
 }
 
-extern "C" fn send_event(this: &mut Object, _sel: Sel, native_event: id) {
-    unsafe {
-        if let Some(event) = PlatformInput::from_native(native_event, None) {
-            let platform = get_mac_platform(this);
-            let mut lock = platform.0.lock();
-            if let Some(mut callback) = lock.event.take() {
-                drop(lock);
-                let result = callback(event);
-                platform.0.lock().event.get_or_insert(callback);
-                if !result {
-                    return;
-                }
-            }
-        }
-        msg_send![super(this, class!(NSApplication)), sendEvent: native_event]
-    }
-}
-
 extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
     unsafe {
         let app: id = msg_send![APP_CLASS, sharedApplication];
         app.setActivationPolicy_(NSApplicationActivationPolicyRegular);
-
         let platform = get_mac_platform(this);
         let callback = platform.0.lock().finish_launching.take();
         if let Some(callback) = callback {
@@ -1039,26 +1045,6 @@ extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_wi
             callback();
             platform.0.lock().reopen.get_or_insert(callback);
         }
-    }
-}
-
-extern "C" fn did_become_active(this: &mut Object, _: Sel, _: id) {
-    let platform = unsafe { get_mac_platform(this) };
-    let mut lock = platform.0.lock();
-    if let Some(mut callback) = lock.become_active.take() {
-        drop(lock);
-        callback();
-        platform.0.lock().become_active.get_or_insert(callback);
-    }
-}
-
-extern "C" fn did_resign_active(this: &mut Object, _: Sel, _: id) {
-    let platform = unsafe { get_mac_platform(this) };
-    let mut lock = platform.0.lock();
-    if let Some(mut callback) = lock.resign_active.take() {
-        drop(lock);
-        callback();
-        platform.0.lock().resign_active.get_or_insert(callback);
     }
 }
 

@@ -1,13 +1,13 @@
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
-    overlay, point, prelude::FluentBuilder, px, rems, AnchorCorner, AnyElement, Bounds,
-    DismissEvent, DispatchPhase, Element, ElementContext, ElementId, InteractiveBounds,
+    anchored, deferred, div, point, prelude::FluentBuilder, px, AnchorCorner, AnyElement, Bounds,
+    DismissEvent, DispatchPhase, Element, ElementId, GlobalElementId, HitboxId, InteractiveElement,
     IntoElement, LayoutId, ManagedView, MouseDownEvent, ParentElement, Pixels, Point, View,
     VisualContext, WindowContext,
 };
 
-use crate::{Clickable, Selectable};
+use crate::prelude::*;
 
 pub trait PopoverTrigger: IntoElement + Clickable + Selectable + 'static {}
 
@@ -51,8 +51,10 @@ impl<M: ManagedView> PopoverMenu<M> {
 
                             cx.subscribe(&new_menu, move |modal, _: &DismissEvent, cx| {
                                 if modal.focus_handle(cx).contains_focused(cx) {
-                                    if previous_focus_handle.is_some() {
-                                        cx.focus(previous_focus_handle.as_ref().unwrap())
+                                    if let Some(previous_focus_handle) =
+                                        previous_focus_handle.as_ref()
+                                    {
+                                        cx.focus(previous_focus_handle);
                                     }
                                 }
                                 *menu2.borrow_mut() = None;
@@ -100,7 +102,7 @@ impl<M: ManagedView> PopoverMenu<M> {
     fn resolved_offset(&self, cx: &WindowContext) -> Point<Pixels> {
         self.offset.unwrap_or_else(|| {
             // Default offset = 4px padding + 1px border
-            let offset = rems(5. / 16.) * cx.rem_size();
+            let offset = rems_from_px(5.) * cx.rem_size();
             match self.anchor {
                 AnchorCorner::TopRight | AnchorCorner::BottomRight => point(offset, px(0.)),
                 AnchorCorner::TopLeft | AnchorCorner::BottomLeft => point(-offset, px(0.)),
@@ -121,99 +123,146 @@ pub fn popover_menu<M: ManagedView>(id: impl Into<ElementId>) -> PopoverMenu<M> 
     }
 }
 
-pub struct PopoverMenuState<M> {
+pub struct PopoverMenuElementState<M> {
+    menu: Rc<RefCell<Option<View<M>>>>,
+    child_bounds: Option<Bounds<Pixels>>,
+}
+
+impl<M> Clone for PopoverMenuElementState<M> {
+    fn clone(&self) -> Self {
+        Self {
+            menu: Rc::clone(&self.menu),
+            child_bounds: self.child_bounds,
+        }
+    }
+}
+
+impl<M> Default for PopoverMenuElementState<M> {
+    fn default() -> Self {
+        Self {
+            menu: Rc::default(),
+            child_bounds: None,
+        }
+    }
+}
+
+pub struct PopoverMenuFrameState {
     child_layout_id: Option<LayoutId>,
     child_element: Option<AnyElement>,
-    child_bounds: Option<Bounds<Pixels>>,
     menu_element: Option<AnyElement>,
-    menu: Rc<RefCell<Option<View<M>>>>,
 }
 
 impl<M: ManagedView> Element for PopoverMenu<M> {
-    type State = PopoverMenuState<M>;
+    type RequestLayoutState = PopoverMenuFrameState;
+    type PrepaintState = Option<HitboxId>;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
 
     fn request_layout(
         &mut self,
-        element_state: Option<Self::State>,
-        cx: &mut ElementContext,
-    ) -> (gpui::LayoutId, Self::State) {
-        let mut menu_layout_id = None;
+        global_id: Option<&GlobalElementId>,
+        cx: &mut WindowContext,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        cx.with_element_state(
+            global_id.unwrap(),
+            |element_state: Option<PopoverMenuElementState<M>>, cx| {
+                let element_state = element_state.unwrap_or_default();
+                let mut menu_layout_id = None;
 
-        let (menu, child_bounds) = if let Some(element_state) = element_state {
-            (element_state.menu, element_state.child_bounds)
-        } else {
-            (Rc::default(), None)
-        };
+                let menu_element = element_state.menu.borrow_mut().as_mut().map(|menu| {
+                    let mut anchored = anchored().snap_to_window().anchor(self.anchor);
+                    if let Some(child_bounds) = element_state.child_bounds {
+                        anchored = anchored.position(
+                            self.resolved_attach().corner(child_bounds) + self.resolved_offset(cx),
+                        );
+                    }
+                    let mut element = deferred(anchored.child(div().occlude().child(menu.clone())))
+                        .with_priority(1)
+                        .into_any();
 
-        let menu_element = menu.borrow_mut().as_mut().map(|menu| {
-            let mut overlay = overlay().snap_to_window().anchor(self.anchor);
+                    menu_layout_id = Some(element.request_layout(cx));
+                    element
+                });
 
-            if let Some(child_bounds) = child_bounds {
-                overlay = overlay.position(
-                    self.resolved_attach().corner(child_bounds) + self.resolved_offset(cx),
+                let mut child_element = self.child_builder.take().map(|child_builder| {
+                    (child_builder)(element_state.menu.clone(), self.menu_builder.clone())
+                });
+
+                let child_layout_id = child_element
+                    .as_mut()
+                    .map(|child_element| child_element.request_layout(cx));
+
+                let layout_id = cx.request_layout(
+                    &gpui::Style::default(),
+                    menu_layout_id.into_iter().chain(child_layout_id),
                 );
-            }
 
-            let mut element = overlay.child(menu.clone()).into_any();
-            menu_layout_id = Some(element.request_layout(cx));
-            element
-        });
-
-        let mut child_element = self
-            .child_builder
-            .take()
-            .map(|child_builder| (child_builder)(menu.clone(), self.menu_builder.clone()));
-
-        let child_layout_id = child_element
-            .as_mut()
-            .map(|child_element| child_element.request_layout(cx));
-
-        let layout_id = cx.request_layout(
-            &gpui::Style::default(),
-            menu_layout_id.into_iter().chain(child_layout_id),
-        );
-
-        (
-            layout_id,
-            PopoverMenuState {
-                menu,
-                child_element,
-                child_layout_id,
-                menu_element,
-                child_bounds,
+                (
+                    (
+                        layout_id,
+                        PopoverMenuFrameState {
+                            child_element,
+                            child_layout_id,
+                            menu_element,
+                        },
+                    ),
+                    element_state,
+                )
             },
         )
     }
 
+    fn prepaint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        _bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        cx: &mut WindowContext,
+    ) -> Option<HitboxId> {
+        if let Some(child) = request_layout.child_element.as_mut() {
+            child.prepaint(cx);
+        }
+
+        if let Some(menu) = request_layout.menu_element.as_mut() {
+            menu.prepaint(cx);
+        }
+
+        let hitbox_id = request_layout.child_layout_id.map(|layout_id| {
+            let bounds = cx.layout_bounds(layout_id);
+            cx.with_element_state(global_id.unwrap(), |element_state, _cx| {
+                let mut element_state: PopoverMenuElementState<M> = element_state.unwrap();
+                element_state.child_bounds = Some(bounds);
+                ((), element_state)
+            });
+
+            cx.insert_hitbox(bounds, false).id
+        });
+
+        hitbox_id
+    }
+
     fn paint(
         &mut self,
+        _id: Option<&GlobalElementId>,
         _: Bounds<gpui::Pixels>,
-        element_state: &mut Self::State,
-        cx: &mut ElementContext,
+        request_layout: &mut Self::RequestLayoutState,
+        child_hitbox: &mut Option<HitboxId>,
+        cx: &mut WindowContext,
     ) {
-        if let Some(mut child) = element_state.child_element.take() {
+        if let Some(mut child) = request_layout.child_element.take() {
             child.paint(cx);
         }
 
-        if let Some(child_layout_id) = element_state.child_layout_id.take() {
-            element_state.child_bounds = Some(cx.layout_bounds(child_layout_id));
-        }
-
-        if let Some(mut menu) = element_state.menu_element.take() {
+        if let Some(mut menu) = request_layout.menu_element.take() {
             menu.paint(cx);
 
-            if let Some(child_bounds) = element_state.child_bounds {
-                let interactive_bounds = InteractiveBounds {
-                    bounds: child_bounds,
-                    stacking_order: cx.stacking_order().clone(),
-                };
-
+            if let Some(child_hitbox) = *child_hitbox {
                 // Mouse-downing outside the menu dismisses it, so we don't
                 // want a click on the toggle to re-open it.
-                cx.on_mouse_event(move |e: &MouseDownEvent, phase, cx| {
-                    if phase == DispatchPhase::Bubble
-                        && interactive_bounds.visibly_contains(&e.position, cx)
-                    {
+                cx.on_mouse_event(move |_: &MouseDownEvent, phase, cx| {
+                    if phase == DispatchPhase::Bubble && child_hitbox.is_hovered(cx) {
                         cx.stop_propagation()
                     }
                 })
@@ -224,10 +273,6 @@ impl<M: ManagedView> Element for PopoverMenu<M> {
 
 impl<M: ManagedView> IntoElement for PopoverMenu<M> {
     type Element = Self;
-
-    fn element_id(&self) -> Option<gpui::ElementId> {
-        Some(self.id.clone())
-    }
 
     fn into_element(self) -> Self::Element {
         self

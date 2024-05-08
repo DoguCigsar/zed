@@ -7,8 +7,7 @@ use anyhow::anyhow;
 use cocoa::appkit::{CGFloat, CGPoint};
 use collections::{BTreeSet, HashMap};
 use core_foundation::{
-    array::CFIndex,
-    attributed_string::{CFAttributedStringRef, CFMutableAttributedString},
+    attributed_string::CFMutableAttributedString,
     base::{CFRange, TCFType},
     number::CFNumber,
     string::CFString,
@@ -42,7 +41,7 @@ use pathfinder_geometry::{
     vector::{Vector2F, Vector2I},
 };
 use smallvec::SmallVec;
-use std::{borrow::Cow, char, cmp, convert::TryFrom, ffi::c_void, sync::Arc};
+use std::{borrow::Cow, char, cmp, convert::TryFrom, sync::Arc};
 
 use super::open_type;
 
@@ -51,13 +50,19 @@ const kCGImageAlphaOnly: u32 = 7;
 
 pub(crate) struct MacTextSystem(RwLock<MacTextSystemState>);
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FontKey {
+    font_family: SharedString,
+    font_features: FontFeatures,
+}
+
 struct MacTextSystemState {
     memory_source: MemSource,
     system_source: SystemSource,
     fonts: Vec<FontKitFont>,
     font_selections: HashMap<Font, FontId>,
     font_ids_by_postscript_name: HashMap<String, FontId>,
-    font_ids_by_family_name: HashMap<SharedString, SmallVec<[FontId; 4]>>,
+    font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
 }
 
@@ -69,7 +74,7 @@ impl MacTextSystem {
             fonts: Vec::new(),
             font_selections: HashMap::default(),
             font_ids_by_postscript_name: HashMap::default(),
-            font_ids_by_family_name: HashMap::default(),
+            font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
         }))
     }
@@ -115,14 +120,16 @@ impl PlatformTextSystem for MacTextSystem {
             Ok(*font_id)
         } else {
             let mut lock = RwLockUpgradableReadGuard::upgrade(lock);
-            let candidates = if let Some(font_ids) = lock.font_ids_by_family_name.get(&font.family)
-            {
+            let font_key = FontKey {
+                font_family: font.family.clone(),
+                font_features: font.features.clone(),
+            };
+            let candidates = if let Some(font_ids) = lock.font_ids_by_font_key.get(&font_key) {
                 font_ids.as_slice()
             } else {
-                let font_ids = lock.load_family(&font.family, font.features)?;
-                lock.font_ids_by_family_name
-                    .insert(font.family.clone(), font_ids);
-                lock.font_ids_by_family_name[&font.family].as_ref()
+                let font_ids = lock.load_family(&font.family, &font.features)?;
+                lock.font_ids_by_font_key.insert(font_key.clone(), font_ids);
+                lock.font_ids_by_font_key[&font_key].as_ref()
             };
 
             let candidate_properties = candidates
@@ -178,16 +185,6 @@ impl PlatformTextSystem for MacTextSystem {
     fn layout_line(&self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
         self.0.write().layout_line(text, font_size, font_runs)
     }
-
-    fn wrap_line(
-        &self,
-        text: &str,
-        font_id: FontId,
-        font_size: Pixels,
-        width: Pixels,
-    ) -> Vec<usize> {
-        self.0.read().wrap_line(text, font_id, font_size, width)
-    }
 }
 
 impl MacTextSystemState {
@@ -213,20 +210,52 @@ impl MacTextSystemState {
 
     fn load_family(
         &mut self,
-        name: &SharedString,
-        features: FontFeatures,
+        name: &str,
+        features: &FontFeatures,
     ) -> Result<SmallVec<[FontId; 4]>> {
+        let name = if name == ".SystemUIFont" {
+            ".AppleSystemUIFont"
+        } else {
+            name
+        };
+
         let mut font_ids = SmallVec::new();
         let family = self
             .memory_source
-            .select_family_by_name(name.as_ref())
-            .or_else(|_| self.system_source.select_family_by_name(name.as_ref()))?;
+            .select_family_by_name(name)
+            .or_else(|_| self.system_source.select_family_by_name(name))?;
         for font in family.fonts() {
             let mut font = font.load()?;
+
             open_type::apply_features(&mut font, features);
-            let Some(_) = font.glyph_for_char('m') else {
-                continue;
-            };
+
+            // This block contains a precautionary fix to guard against loading fonts
+            // that might cause panics due to `.unwrap()`s up the chain.
+            {
+                // We use the 'm' character for text measurements in various spots
+                // (e.g., the editor). However, at time of writing some of those usages
+                // will panic if the font has no 'm' glyph.
+                //
+                // Therefore, we check up front that the font has the necessary glyph.
+                let has_m_glyph = font.glyph_for_char('m').is_some();
+
+                // HACK: The 'Segoe Fluent Icons' font does not have an 'm' glyph,
+                // but we need to be able to load it for rendering Windows icons in
+                // the Storybook (on macOS).
+                let is_segoe_fluent_icons = font.full_name() == "Segoe Fluent Icons";
+
+                if !has_m_glyph && !is_segoe_fluent_icons {
+                    // I spent far too long trying to track down why a font missing the 'm'
+                    // character wasn't loading. This log statement will hopefully save
+                    // someone else from suffering the same fate.
+                    log::warn!(
+                        "font '{}' has no 'm' character and was not loaded",
+                        font.full_name()
+                    );
+                    continue;
+                }
+            }
+
             // We've seen a number of panics in production caused by calling font.properties()
             // which unwraps a downcast to CFNumber. This is an attempt to avoid the panic,
             // and to try and identify the incalcitrant font.
@@ -298,7 +327,7 @@ impl MacTextSystemState {
         self.postscript_names_by_font_id
             .get(&font_id)
             .map_or(false, |postscript_name| {
-                postscript_name == "AppleColorEmoji"
+                postscript_name == "AppleColorEmoji" || postscript_name == ".AppleColorEmojiUI"
             })
     }
 
@@ -487,43 +516,6 @@ impl MacTextSystemState {
             len: text.len(),
         }
     }
-
-    fn wrap_line(
-        &self,
-        text: &str,
-        font_id: FontId,
-        font_size: Pixels,
-        width: Pixels,
-    ) -> Vec<usize> {
-        let mut string = CFMutableAttributedString::new();
-        string.replace_str(&CFString::new(text), CFRange::init(0, 0));
-        let cf_range = CFRange::init(0, text.encode_utf16().count() as isize);
-        let font = &self.fonts[font_id.0];
-        unsafe {
-            string.set_attribute(
-                cf_range,
-                kCTFontAttributeName,
-                &font.native_font().clone_with_font_size(font_size.into()),
-            );
-
-            let typesetter = CTTypesetterCreateWithAttributedString(string.as_concrete_TypeRef());
-            let mut ix_converter = StringIndexConverter::new(text);
-            let mut break_indices = Vec::new();
-            while ix_converter.utf8_ix < text.len() {
-                let utf16_len = CTTypesetterSuggestLineBreak(
-                    typesetter,
-                    ix_converter.utf16_ix as isize,
-                    width.into(),
-                ) as usize;
-                ix_converter.advance_to_utf16_ix(ix_converter.utf16_ix + utf16_len);
-                if ix_converter.utf8_ix >= text.len() {
-                    break;
-                }
-                break_indices.push(ix_converter.utf8_ix);
-            }
-            break_indices
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -563,22 +555,6 @@ impl<'a> StringIndexConverter<'a> {
         }
         self.utf8_ix = self.text.len();
     }
-}
-
-#[repr(C)]
-pub(crate) struct __CFTypesetter(c_void);
-
-type CTTypesetterRef = *const __CFTypesetter;
-
-#[link(name = "CoreText", kind = "framework")]
-extern "C" {
-    fn CTTypesetterCreateWithAttributedString(string: CFAttributedStringRef) -> CTTypesetterRef;
-
-    fn CTTypesetterSuggestLineBreak(
-        typesetter: CTTypesetterRef,
-        start_index: CFIndex,
-        width: f64,
-    ) -> CFIndex;
 }
 
 impl From<Metrics> for FontMetrics {
@@ -700,23 +676,6 @@ mod lenient_font_attributes {
 #[cfg(test)]
 mod tests {
     use crate::{font, px, FontRun, GlyphId, MacTextSystem, PlatformTextSystem};
-
-    #[test]
-    fn test_wrap_line() {
-        let fonts = MacTextSystem::new();
-        let font_id = fonts.font_id(&font("Helvetica")).unwrap();
-
-        let line = "one two three four five\n";
-        let wrap_boundaries = fonts.wrap_line(line, font_id, px(16.), px(64.0));
-        assert_eq!(wrap_boundaries, &["one two ".len(), "one two three ".len()]);
-
-        let line = "aaa ααα ✋✋✋ 🎉🎉🎉\n";
-        let wrap_boundaries = fonts.wrap_line(line, font_id, px(16.), px(64.0));
-        assert_eq!(
-            wrap_boundaries,
-            &["aaa ααα ".len(), "aaa ααα ✋✋✋ ".len(),]
-        );
-    }
 
     #[test]
     fn test_layout_line_bom_char() {

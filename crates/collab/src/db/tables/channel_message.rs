@@ -11,7 +11,9 @@ pub struct Model {
     pub sender_id: UserId,
     pub body: String,
     pub sent_at: PrimitiveDateTime,
+    pub edited_at: Option<PrimitiveDateTime>,
     pub nonce: Uuid,
+    pub reply_to_message_id: Option<MessageId>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
-use fs::repository::Branch;
 use fuzzy::{StringMatch, StringMatchCandidate};
+use git::repository::Branch;
 use gpui::{
     actions, rems, AnyElement, AppContext, DismissEvent, Element, EventEmitter, FocusHandle,
     FocusableView, InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled,
@@ -9,10 +9,11 @@ use gpui::{
 use picker::{Picker, PickerDelegate};
 use std::{ops::Not, sync::Arc};
 use ui::{
-    h_flex, v_flex, Button, ButtonCommon, Clickable, HighlightedLabel, Label, LabelCommon,
+    h_flex, v_flex, Button, ButtonCommon, Clickable, Color, HighlightedLabel, Label, LabelCommon,
     LabelSize, ListItem, ListItemSpacing, Selectable,
 };
 use util::ResultExt;
+use workspace::notifications::NotificationId;
 use workspace::{ModalView, Toast, Workspace};
 
 actions!(branches, [OpenRecent]);
@@ -34,7 +35,7 @@ pub struct BranchList {
 
 impl BranchList {
     fn new(delegate: BranchListDelegate, rem_width: f32, cx: &mut ViewContext<Self>) -> Self {
-        let picker = cx.new_view(|cx| Picker::new(delegate, cx));
+        let picker = cx.new_view(|cx| Picker::uniform_list(delegate, cx));
         let _subscription = cx.subscribe(&picker, |_, _, _, cx| cx.emit(DismissEvent));
         Self {
             picker,
@@ -125,9 +126,11 @@ impl BranchListDelegate {
     }
 
     fn display_error_toast(&self, message: String, cx: &mut WindowContext<'_>) {
-        const GIT_CHECKOUT_FAILURE_ID: usize = 2048;
         self.workspace.update(cx, |model, ctx| {
-            model.show_toast(Toast::new(GIT_CHECKOUT_FAILURE_ID, message), ctx)
+            struct GitCheckoutFailure;
+            let id = NotificationId::unique::<GitCheckoutFailure>();
+
+            model.show_toast(Toast::new(id, message), ctx)
         });
     }
 }
@@ -135,7 +138,7 @@ impl BranchListDelegate {
 impl PickerDelegate for BranchListDelegate {
     type ListItem = ListItem;
 
-    fn placeholder_text(&self) -> Arc<str> {
+    fn placeholder_text(&self, _cx: &mut WindowContext) -> Arc<str> {
         "Select branch...".into()
     }
 
@@ -156,14 +159,20 @@ impl PickerDelegate for BranchListDelegate {
             let candidates = picker.update(&mut cx, |view, _| {
                 const RECENT_BRANCHES_COUNT: usize = 10;
                 let mut branches = view.delegate.all_branches.clone();
-                if query.is_empty() && branches.len() > RECENT_BRANCHES_COUNT {
-                    // Truncate list of recent branches
-                    // Do a partial sort to show recent-ish branches first.
-                    branches.select_nth_unstable_by(RECENT_BRANCHES_COUNT - 1, |lhs, rhs| {
-                        rhs.unix_timestamp.cmp(&lhs.unix_timestamp)
+                if query.is_empty() {
+                    if branches.len() > RECENT_BRANCHES_COUNT {
+                        // Truncate list of recent branches
+                        // Do a partial sort to show recent-ish branches first.
+                        branches.select_nth_unstable_by(RECENT_BRANCHES_COUNT - 1, |lhs, rhs| {
+                            rhs.is_head
+                                .cmp(&lhs.is_head)
+                                .then(rhs.unix_timestamp.cmp(&lhs.unix_timestamp))
+                        });
+                        branches.truncate(RECENT_BRANCHES_COUNT);
+                    }
+                    branches.sort_unstable_by(|lhs, rhs| {
+                        rhs.is_head.cmp(&lhs.is_head).then(lhs.name.cmp(&rhs.name))
                     });
-                    branches.truncate(RECENT_BRANCHES_COUNT);
-                    branches.sort_unstable_by(|lhs, rhs| lhs.name.cmp(&rhs.name));
                 }
                 branches
                     .into_iter()
@@ -292,11 +301,13 @@ impl PickerDelegate for BranchListDelegate {
         let label = if self.last_query.is_empty() {
             h_flex()
                 .ml_3()
-                .child(Label::new("Recent branches").size(LabelSize::Small))
+                .child(Label::new("Recent Branches").size(LabelSize::Small))
         } else {
             let match_label = self.matches.is_empty().not().then(|| {
                 let suffix = if self.matches.len() == 1 { "" } else { "es" };
-                Label::new(format!("{} match{}", self.matches.len(), suffix)).size(LabelSize::Small)
+                Label::new(format!("{} match{}", self.matches.len(), suffix))
+                    .color(Color::Muted)
+                    .size(LabelSize::Small)
             });
             h_flex()
                 .px_3()
@@ -305,7 +316,7 @@ impl PickerDelegate for BranchListDelegate {
                 .child(Label::new("Branches").size(LabelSize::Small))
                 .children(match_label)
         };
-        Some(label.into_any())
+        Some(label.mt_1().into_any())
     }
     fn render_footer(&self, cx: &mut ViewContext<Picker<Self>>) -> Option<AnyElement> {
         if self.last_query.is_empty() {

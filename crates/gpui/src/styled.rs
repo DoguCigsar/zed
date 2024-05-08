@@ -1,11 +1,11 @@
 use crate::{
     self as gpui, hsla, point, px, relative, rems, AbsoluteLength, AlignItems, CursorStyle,
-    DefiniteLength, Fill, FlexDirection, FontWeight, Hsla, JustifyContent, Length, Position,
-    SharedString, StyleRefinement, Visibility, WhiteSpace,
+    DefiniteLength, Fill, FlexDirection, FlexWrap, Font, FontStyle, FontWeight, Hsla,
+    JustifyContent, Length, Position, SharedString, StyleRefinement, Visibility, WhiteSpace,
 };
 use crate::{BoxShadow, TextStyleRefinement};
 use smallvec::{smallvec, SmallVec};
-use taffy::style::{Display, Overflow};
+use taffy::style::{AlignContent, Display, Overflow};
 
 /// A trait for elements that can be styled.
 /// Use this to opt-in to a CSS-like styling API.
@@ -14,19 +14,6 @@ pub trait Styled: Sized {
     fn style(&mut self) -> &mut StyleRefinement;
 
     gpui_macros::style_helpers!();
-
-    /// Set the z-index of this element.
-    fn z_index(mut self, z_index: u16) -> Self {
-        self.style().z_index = Some(z_index);
-        self
-    }
-
-    /// Sets the size of the element to sthe full width and height.
-    fn full(mut self) -> Self {
-        self.style().size.width = Some(relative(1.).into());
-        self.style().size.height = Some(relative(1.).into());
-        self
-    }
 
     /// Sets the position of the element to `relative`.
     /// [Docs](https://tailwindcss.com/docs/position)
@@ -189,17 +176,31 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets cursor style when hovering over an element to `ew-resize`.
+    /// [Docs](https://tailwindcss.com/docs/cursor)
+    fn cursor_ew_resize(mut self) -> Self {
+        self.style().mouse_cursor = Some(CursorStyle::ResizeLeftRight);
+        self
+    }
+
+    /// Sets cursor style when hovering over an element to `ns-resize`.
+    /// [Docs](https://tailwindcss.com/docs/cursor)
+    fn cursor_ns_resize(mut self) -> Self {
+        self.style().mouse_cursor = Some(CursorStyle::ResizeUpDown);
+        self
+    }
+
     /// Sets cursor style when hovering over an element to `col-resize`.
     /// [Docs](https://tailwindcss.com/docs/cursor)
     fn cursor_col_resize(mut self) -> Self {
-        self.style().mouse_cursor = Some(CursorStyle::ResizeLeftRight);
+        self.style().mouse_cursor = Some(CursorStyle::ResizeColumn);
         self
     }
 
     /// Sets cursor style when hovering over an element to `row-resize`.
     /// [Docs](https://tailwindcss.com/docs/cursor)
     fn cursor_row_resize(mut self) -> Self {
-        self.style().mouse_cursor = Some(CursorStyle::ResizeUpDown);
+        self.style().mouse_cursor = Some(CursorStyle::ResizeRow);
         self
     }
 
@@ -340,6 +341,27 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the element to allow flex items to wrap.
+    /// [Docs](https://tailwindcss.com/docs/flex-wrap#wrap-normally)
+    fn flex_wrap(mut self) -> Self {
+        self.style().flex_wrap = Some(FlexWrap::Wrap);
+        self
+    }
+
+    /// Sets the element wrap flex items in the reverse direction.
+    /// [Docs](https://tailwindcss.com/docs/flex-wrap#wrap-reversed)
+    fn flex_wrap_reverse(mut self) -> Self {
+        self.style().flex_wrap = Some(FlexWrap::WrapReverse);
+        self
+    }
+
+    /// Sets the element to prevent flex items from wrapping, causing inflexible items to overflow the container if necessary.
+    /// [Docs](https://tailwindcss.com/docs/flex-wrap#dont-wrap)
+    fn flex_nowrap(mut self) -> Self {
+        self.style().flex_wrap = Some(FlexWrap::NoWrap);
+        self
+    }
+
     /// Sets the element to align flex items to the start of the container's cross axis.
     /// [Docs](https://tailwindcss.com/docs/align-items#start)
     fn items_start(mut self) -> Self {
@@ -395,6 +417,65 @@ pub trait Styled: Sized {
     /// [Docs](https://tailwindcss.com/docs/justify-content#space-around)
     fn justify_around(mut self) -> Self {
         self.style().justify_content = Some(JustifyContent::SpaceAround);
+        self
+    }
+
+    /// Sets the element to pack content items in their default position as if no align-content value was set.
+    /// [Docs](https://tailwindcss.com/docs/align-content#normal)
+    fn content_normal(mut self) -> Self {
+        self.style().align_content = None;
+        self
+    }
+
+    /// Sets the element to pack content items in the center of the container's cross axis.
+    /// [Docs](https://tailwindcss.com/docs/align-content#center)
+    fn content_center(mut self) -> Self {
+        self.style().align_content = Some(AlignContent::Center);
+        self
+    }
+
+    /// Sets the element to pack content items against the start of the container's cross axis.
+    /// [Docs](https://tailwindcss.com/docs/align-content#start)
+    fn content_start(mut self) -> Self {
+        self.style().align_content = Some(AlignContent::FlexStart);
+        self
+    }
+
+    /// Sets the element to pack content items against the end of the container's cross axis.
+    /// [Docs](https://tailwindcss.com/docs/align-content#end)
+    fn content_end(mut self) -> Self {
+        self.style().align_content = Some(AlignContent::FlexEnd);
+        self
+    }
+
+    /// Sets the element to pack content items along the container's cross axis
+    /// such that there is an equal amount of space between each item.
+    /// [Docs](https://tailwindcss.com/docs/align-content#space-between)
+    fn content_between(mut self) -> Self {
+        self.style().align_content = Some(AlignContent::SpaceBetween);
+        self
+    }
+
+    /// Sets the element to pack content items along the container's cross axis
+    /// such that there is an equal amount of space on each side of each item.
+    /// [Docs](https://tailwindcss.com/docs/align-content#space-around)
+    fn content_around(mut self) -> Self {
+        self.style().align_content = Some(AlignContent::SpaceAround);
+        self
+    }
+
+    /// Sets the element to pack content items along the container's cross axis
+    /// such that there is an equal amount of space between each item.
+    /// [Docs](https://tailwindcss.com/docs/align-content#space-evenly)
+    fn content_evenly(mut self) -> Self {
+        self.style().align_content = Some(AlignContent::SpaceEvenly);
+        self
+    }
+
+    /// Sets the element to allow content items to fill the available space along the container's cross axis.
+    /// [Docs](https://tailwindcss.com/docs/align-content#stretch)
+    fn content_stretch(mut self) -> Self {
+        self.style().align_content = Some(AlignContent::Stretch);
         self
     }
 
@@ -522,13 +603,13 @@ pub trait Styled: Sized {
         &mut style.text
     }
 
-    /// Set the text color of this element, this value cascades to it's child elements.
+    /// Set the text color of this element, this value cascades to its child elements.
     fn text_color(mut self, color: impl Into<Hsla>) -> Self {
         self.text_style().get_or_insert_with(Default::default).color = Some(color.into());
         self
     }
 
-    /// Set the font weight of this element, this value cascades to it's child elements.
+    /// Set the font weight of this element, this value cascades to its child elements.
     fn font_weight(mut self, weight: FontWeight) -> Self {
         self.text_style()
             .get_or_insert_with(Default::default)
@@ -536,7 +617,7 @@ pub trait Styled: Sized {
         self
     }
 
-    /// Set the background color of this element, this value cascades to it's child elements.
+    /// Set the background color of this element, this value cascades to its child elements.
     fn text_bg(mut self, bg: impl Into<Hsla>) -> Self {
         self.text_style()
             .get_or_insert_with(Default::default)
@@ -544,7 +625,7 @@ pub trait Styled: Sized {
         self
     }
 
-    /// Set the text size of this element, this value cascades to it's child elements.
+    /// Set the text size of this element, this value cascades to its child elements.
     fn text_size(mut self, size: impl Into<AbsoluteLength>) -> Self {
         self.text_style()
             .get_or_insert_with(Default::default)
@@ -570,7 +651,7 @@ pub trait Styled: Sized {
         self
     }
 
-    /// Reset the text styling for this element and it's children.
+    /// Reset the text styling for this element and its children.
     fn text_base(mut self) -> Self {
         self.text_style()
             .get_or_insert_with(Default::default)
@@ -614,7 +695,25 @@ pub trait Styled: Sized {
         self
     }
 
-    /// Remove the text decoration on this element, this value cascades to it's child elements.
+    /// Set the font style to 'non-italic',
+    /// see the [Tailwind Docs](https://tailwindcss.com/docs/font-style#italicizing-text)
+    fn non_italic(mut self) -> Self {
+        self.text_style()
+            .get_or_insert_with(Default::default)
+            .font_style = Some(FontStyle::Normal);
+        self
+    }
+
+    /// Set the font style to 'italic',
+    /// see the [Tailwind Docs](https://tailwindcss.com/docs/font-style#italicizing-text)
+    fn italic(mut self) -> Self {
+        self.text_style()
+            .get_or_insert_with(Default::default)
+            .font_style = Some(FontStyle::Italic);
+        self
+    }
+
+    /// Remove the text decoration on this element, this value cascades to its child elements.
     fn text_decoration_none(mut self) -> Self {
         self.text_style()
             .get_or_insert_with(Default::default)
@@ -686,15 +785,33 @@ pub trait Styled: Sized {
         self
     }
 
-    /// Change the font on this element and it's children.
-    fn font(mut self, family_name: impl Into<SharedString>) -> Self {
+    /// Change the font family on this element and its children.
+    fn font_family(mut self, family_name: impl Into<SharedString>) -> Self {
         self.text_style()
             .get_or_insert_with(Default::default)
             .font_family = Some(family_name.into());
         self
     }
 
-    /// Set the line height on this element and it's children.
+    /// Change the font of this element and its children.
+    fn font(mut self, font: Font) -> Self {
+        let Font {
+            family,
+            features,
+            weight,
+            style,
+        } = font;
+
+        let text_style = self.text_style().get_or_insert_with(Default::default);
+        text_style.font_family = Some(family);
+        text_style.font_features = Some(features);
+        text_style.font_weight = Some(weight);
+        text_style.font_style = Some(style);
+
+        self
+    }
+
+    /// Set the line height on this element and its children.
     fn line_height(mut self, line_height: impl Into<DefiniteLength>) -> Self {
         self.text_style()
             .get_or_insert_with(Default::default)

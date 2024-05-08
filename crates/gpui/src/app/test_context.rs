@@ -1,13 +1,14 @@
 use crate::{
-    Action, AnyElement, AnyView, AnyWindowHandle, AppCell, AppContext, AsyncAppContext,
-    AvailableSpace, BackgroundExecutor, Bounds, ClipboardItem, Context, Entity, EventEmitter,
-    ForegroundExecutor, Global, InputEvent, Keystroke, Model, ModelContext, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Platform, Point, Render, Result, Size, Task, TestDispatcher, TestPlatform, TestWindow,
-    TextSystem, View, ViewContext, VisualContext, WindowContext, WindowHandle, WindowOptions,
+    Action, AnyView, AnyWindowHandle, AppCell, AppContext, AsyncAppContext, AvailableSpace,
+    BackgroundExecutor, BorrowAppContext, Bounds, ClipboardItem, Context, DrawPhase, Drawable,
+    Element, Empty, Entity, EventEmitter, ForegroundExecutor, Global, InputEvent, Keystroke, Model,
+    ModelContext, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Platform, Point, Render, Result, Size, Task, TestDispatcher,
+    TestPlatform, TestWindow, TextSystem, View, ViewContext, VisualContext, WindowBounds,
+    WindowContext, WindowHandle, WindowOptions,
 };
 use anyhow::{anyhow, bail};
-use futures::{Stream, StreamExt};
+use futures::{channel::oneshot, Stream, StreamExt};
 use std::{cell::RefCell, future::Future, ops::Deref, rc::Rc, sync::Arc, time::Duration};
 
 /// A TestAppContext is provided to tests created with `#[gpui::test]`, it provides
@@ -34,12 +35,23 @@ impl Context for TestAppContext {
     fn new_model<T: 'static>(
         &mut self,
         build_model: impl FnOnce(&mut ModelContext<'_, T>) -> T,
-    ) -> Self::Result<Model<T>>
-    where
-        T: 'static,
-    {
+    ) -> Self::Result<Model<T>> {
         let mut app = self.app.borrow_mut();
         app.new_model(build_model)
+    }
+
+    fn reserve_model<T: 'static>(&mut self) -> Self::Result<crate::Reservation<T>> {
+        let mut app = self.app.borrow_mut();
+        app.reserve_model()
+    }
+
+    fn insert_model<T: 'static>(
+        &mut self,
+        reservation: crate::Reservation<T>,
+        build_model: impl FnOnce(&mut ModelContext<'_, T>) -> T,
+    ) -> Self::Result<Model<T>> {
+        let mut app = self.app.borrow_mut();
+        app.insert_model(reservation, build_model)
     }
 
     fn update_model<T: 'static, R>(
@@ -49,14 +61,6 @@ impl Context for TestAppContext {
     ) -> Self::Result<R> {
         let mut app = self.app.borrow_mut();
         app.update_model(handle, update)
-    }
-
-    fn update_window<T, F>(&mut self, window: AnyWindowHandle, f: F) -> Result<T>
-    where
-        F: FnOnce(AnyView, &mut WindowContext<'_>) -> T,
-    {
-        let mut lock = self.app.borrow_mut();
-        lock.update_window(window, f)
     }
 
     fn read_model<T, R>(
@@ -69,6 +73,14 @@ impl Context for TestAppContext {
     {
         let app = self.app.borrow();
         app.read_model(handle, read)
+    }
+
+    fn update_window<T, F>(&mut self, window: AnyWindowHandle, f: F) -> Result<T>
+    where
+        F: FnOnce(AnyView, &mut WindowContext<'_>) -> T,
+    {
+        let mut lock = self.app.borrow_mut();
+        lock.update_window(window, f)
     }
 
     fn read_window<T, R>(
@@ -160,7 +172,7 @@ impl TestAppContext {
     /// Gives you an `&AppContext` for the duration of the closure
     pub fn read<R>(&self, f: impl FnOnce(&AppContext) -> R) -> R {
         let cx = self.app.borrow();
-        f(&*cx)
+        f(&cx)
     }
 
     /// Adds a new window. The Window will always be backed by a `TestWindow` which
@@ -171,13 +183,29 @@ impl TestAppContext {
         V: 'static + Render,
     {
         let mut cx = self.app.borrow_mut();
-        cx.open_window(WindowOptions::default(), |cx| cx.new_view(build_window))
+
+        // Some tests rely on the window size matching the bounds of the test display
+        let bounds = Bounds::maximized(None, &mut cx);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            |cx| cx.new_view(build_window),
+        )
     }
 
     /// Adds a new window with no content.
     pub fn add_empty_window(&mut self) -> &mut VisualTestContext {
         let mut cx = self.app.borrow_mut();
-        let window = cx.open_window(WindowOptions::default(), |cx| cx.new_view(|_| ()));
+        let bounds = Bounds::maximized(None, &mut cx);
+        let window = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            |cx| cx.new_view(|_| Empty),
+        );
         drop(cx);
         let cx = VisualTestContext::from_window(*window.deref(), self).as_mut();
         cx.run_until_parked();
@@ -187,13 +215,20 @@ impl TestAppContext {
     /// Adds a new window, and returns its root view and a `VisualTestContext` which can be used
     /// as a `WindowContext` for the rest of the test. Typically you would shadow this context with
     /// the returned one. `let (view, cx) = cx.add_window_view(...);`
-    pub fn add_window_view<F, V>(&mut self, build_window: F) -> (View<V>, &mut VisualTestContext)
+    pub fn add_window_view<F, V>(&mut self, build_root_view: F) -> (View<V>, &mut VisualTestContext)
     where
         F: FnOnce(&mut ViewContext<V>) -> V,
         V: 'static + Render,
     {
         let mut cx = self.app.borrow_mut();
-        let window = cx.open_window(WindowOptions::default(), |cx| cx.new_view(build_window));
+        let bounds = Bounds::maximized(None, &mut cx);
+        let window = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            |cx| cx.new_view(build_root_view),
+        );
         drop(cx);
         let view = window.root_view(self).unwrap();
         let cx = VisualTestContext::from_window(*window.deref(), self).as_mut();
@@ -286,7 +321,7 @@ impl TestAppContext {
     /// sets the global in this context.
     pub fn set_global<G: Global>(&mut self, global: G) {
         let mut lock = self.app.borrow_mut();
-        lock.set_global(global);
+        lock.update(|cx| cx.set_global(global))
     }
 
     /// updates the global in this context. (panics if `has_global` would return false)
@@ -295,7 +330,7 @@ impl TestAppContext {
         update: impl FnOnce(&mut G, &mut AppContext) -> R,
     ) -> R {
         let mut lock = self.app.borrow_mut();
-        lock.update_global(update)
+        lock.update(|cx| cx.update_global(update))
     }
 
     /// Returns an `AsyncAppContext` which can be used to run tasks that expect to be on a background
@@ -331,11 +366,11 @@ impl TestAppContext {
     /// This will also run the background executor until it's parked.
     pub fn simulate_keystrokes(&mut self, window: AnyWindowHandle, keystrokes: &str) {
         for keystroke in keystrokes
-            .split(" ")
+            .split(' ')
             .map(Keystroke::parse)
             .map(Result::unwrap)
         {
-            self.dispatch_keystroke(window, keystroke.into(), false);
+            self.dispatch_keystroke(window, keystroke);
         }
 
         self.background_executor.run_until_parked()
@@ -347,21 +382,16 @@ impl TestAppContext {
     /// This will also run the background executor until it's parked.
     pub fn simulate_input(&mut self, window: AnyWindowHandle, input: &str) {
         for keystroke in input.split("").map(Keystroke::parse).map(Result::unwrap) {
-            self.dispatch_keystroke(window, keystroke.into(), false);
+            self.dispatch_keystroke(window, keystroke);
         }
 
         self.background_executor.run_until_parked()
     }
 
     /// dispatches a single Keystroke (see also `simulate_keystrokes` and `simulate_input`)
-    pub fn dispatch_keystroke(
-        &mut self,
-        window: AnyWindowHandle,
-        keystroke: Keystroke,
-        is_held: bool,
-    ) {
-        self.test_window(window)
-            .simulate_keystroke(keystroke, is_held)
+    pub fn dispatch_keystroke(&mut self, window: AnyWindowHandle, keystroke: Keystroke) {
+        self.update_window(window, |_, cx| cx.dispatch_keystroke(keystroke))
+            .unwrap();
     }
 
     /// Returns the `TestWindow` backing the given handle.
@@ -445,33 +475,53 @@ impl TestAppContext {
     }
 }
 
-impl<T: Send> Model<T> {
+impl<T: 'static> Model<T> {
     /// Block until the next event is emitted by the model, then return it.
-    pub fn next_event<Evt>(&self, cx: &mut TestAppContext) -> Evt
+    pub fn next_event<Event>(&self, cx: &mut TestAppContext) -> impl Future<Output = Event>
     where
-        Evt: Send + Clone + 'static,
-        T: EventEmitter<Evt>,
+        Event: Send + Clone + 'static,
+        T: EventEmitter<Event>,
     {
-        let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        let _subscription = self.update(cx, |_, cx| {
+        let (tx, mut rx) = oneshot::channel();
+        let mut tx = Some(tx);
+        let subscription = self.update(cx, |_, cx| {
             cx.subscribe(self, move |_, _, event, _| {
-                tx.unbounded_send(event.clone()).ok();
+                if let Some(tx) = tx.take() {
+                    _ = tx.send(event.clone());
+                }
             })
         });
 
-        // Run other tasks until the event is emitted.
-        loop {
-            match rx.try_next() {
-                Ok(Some(event)) => return event,
-                Ok(None) => panic!("model was dropped"),
-                Err(_) => {
-                    if !cx.executor().tick() {
-                        break;
-                    }
-                }
-            }
+        async move {
+            let event = rx.await.expect("no event emitted");
+            drop(subscription);
+            event
         }
-        panic!("no event received")
+    }
+
+    /// Returns a future that resolves when the model notifies.
+    pub fn next_notification(&self, cx: &TestAppContext) -> impl Future<Output = ()> {
+        use postage::prelude::{Sink as _, Stream as _};
+
+        let (mut tx, mut rx) = postage::mpsc::channel(1);
+        let mut cx = cx.app.app.borrow_mut();
+        let subscription = cx.observe(self, move |_, _| {
+            tx.try_send(()).ok();
+        });
+
+        let duration = if std::env::var("CI").is_ok() {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        };
+
+        async move {
+            let notification = crate::util::timeout(duration, rx.recv())
+                .await
+                .expect("next notification timed out");
+            drop(subscription);
+            notification.expect("model dropped while test was waiting for its next notification")
+        }
     }
 }
 
@@ -580,7 +630,7 @@ pub struct VisualTestContext {
     window: AnyWindowHandle,
 }
 
-impl<'a> VisualTestContext {
+impl VisualTestContext {
     /// Get the underlying window handle underlying this context.
     pub fn handle(&self) -> AnyWindowHandle {
         self.window
@@ -632,11 +682,47 @@ impl<'a> VisualTestContext {
     }
 
     /// Simulate a mouse move event to the given point
-    pub fn simulate_mouse_move(&mut self, position: Point<Pixels>, modifiers: Modifiers) {
+    pub fn simulate_mouse_move(
+        &mut self,
+        position: Point<Pixels>,
+        button: impl Into<Option<MouseButton>>,
+        modifiers: Modifiers,
+    ) {
         self.simulate_event(MouseMoveEvent {
             position,
             modifiers,
-            pressed_button: None,
+            pressed_button: button.into(),
+        })
+    }
+
+    /// Simulate a mouse down event to the given point
+    pub fn simulate_mouse_down(
+        &mut self,
+        position: Point<Pixels>,
+        button: MouseButton,
+        modifiers: Modifiers,
+    ) {
+        self.simulate_event(MouseDownEvent {
+            position,
+            modifiers,
+            button,
+            click_count: 1,
+            first_mouse: false,
+        })
+    }
+
+    /// Simulate a mouse up event to the given point
+    pub fn simulate_mouse_up(
+        &mut self,
+        position: Point<Pixels>,
+        button: MouseButton,
+        modifiers: Modifiers,
+    ) {
+        self.simulate_event(MouseUpEvent {
+            position,
+            modifiers,
+            button,
+            click_count: 1,
         })
     }
 
@@ -647,6 +733,7 @@ impl<'a> VisualTestContext {
             modifiers,
             button: MouseButton::Left,
             click_count: 1,
+            first_mouse: false,
         });
         self.simulate_event(MouseUpEvent {
             position,
@@ -672,27 +759,28 @@ impl<'a> VisualTestContext {
     }
 
     /// Draw an element to the window. Useful for simulating events or actions
-    pub fn draw(
+    pub fn draw<E>(
         &mut self,
         origin: Point<Pixels>,
-        space: Size<AvailableSpace>,
-        f: impl FnOnce(&mut WindowContext) -> AnyElement,
-    ) {
+        space: impl Into<Size<AvailableSpace>>,
+        f: impl FnOnce(&mut WindowContext) -> E,
+    ) -> (E::RequestLayoutState, E::PrepaintState)
+    where
+        E: Element,
+    {
         self.update(|cx| {
-            let entity_id = cx
-                .window
-                .root_view
-                .as_ref()
-                .expect("Can't draw to this window without a root view")
-                .entity_id();
+            cx.window.draw_phase = DrawPhase::Prepaint;
+            let mut element = Drawable::new(f(cx));
+            element.layout_as_root(space.into(), cx);
+            cx.with_absolute_element_offset(origin, |cx| element.prepaint(cx));
 
-            cx.with_element_context(|cx| {
-                cx.with_view_id(entity_id, |cx| {
-                    f(cx).draw(origin, space, cx);
-                })
-            });
+            cx.window.draw_phase = DrawPhase::Paint;
+            let (request_layout_state, prepaint_state) = element.paint(cx);
 
+            cx.window.draw_phase = DrawPhase::None;
             cx.refresh();
+
+            (request_layout_state, prepaint_state)
         })
     }
 
@@ -764,6 +852,18 @@ impl Context for VisualTestContext {
         build_model: impl FnOnce(&mut ModelContext<'_, T>) -> T,
     ) -> Self::Result<Model<T>> {
         self.cx.new_model(build_model)
+    }
+
+    fn reserve_model<T: 'static>(&mut self) -> Self::Result<crate::Reservation<T>> {
+        self.cx.reserve_model()
+    }
+
+    fn insert_model<T: 'static>(
+        &mut self,
+        reservation: crate::Reservation<T>,
+        build_model: impl FnOnce(&mut ModelContext<'_, T>) -> T,
+    ) -> Self::Result<Model<T>> {
+        self.cx.insert_model(reservation, build_model)
     }
 
     fn update_model<T, R>(

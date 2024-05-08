@@ -90,24 +90,26 @@ impl ParentElement for TabBar {
 
 impl RenderOnce for TabBar {
     fn render(self, cx: &mut WindowContext) -> impl IntoElement {
-        const HEIGHT_IN_REMS: f32 = 29. / 16.;
-
         div()
             .id(self.id)
             .group("tab_bar")
             .flex()
             .flex_none()
             .w_full()
-            .h(rems(HEIGHT_IN_REMS))
+            .h(
+                // TODO: This should scale with [UiDensity], however tabs,
+                // and other tab bar tools need to scale dynamically first.
+                rems_from_px(29.),
+            )
             .bg(cx.theme().colors().tab_bar_background)
             .when(!self.start_children.is_empty(), |this| {
                 this.child(
                     h_flex()
                         .flex_none()
-                        .gap_1()
-                        .px_1()
-                        .border_b()
-                        .border_r()
+                        .gap(Spacing::Small.rems(cx))
+                        .px(Spacing::Medium.rems(cx))
+                        .border_b_1()
+                        .border_r_1()
                         .border_color(cx.theme().colors().border)
                         .children(self.start_children),
                 )
@@ -123,15 +125,13 @@ impl RenderOnce for TabBar {
                             .absolute()
                             .top_0()
                             .left_0()
-                            .z_index(1)
                             .size_full()
-                            .border_b()
+                            .border_b_1()
                             .border_color(cx.theme().colors().border),
                     )
                     .child(
                         h_flex()
                             .id("tabs")
-                            .z_index(2)
                             .flex_grow()
                             .overflow_x_scroll()
                             .when_some(self.scroll_handle, |cx, scroll_handle| {
@@ -144,10 +144,10 @@ impl RenderOnce for TabBar {
                 this.child(
                     h_flex()
                         .flex_none()
-                        .gap_1()
-                        .px_1()
-                        .border_b()
-                        .border_l()
+                        .gap(Spacing::Small.rems(cx))
+                        .px(Spacing::Medium.rems(cx))
+                        .border_b_1()
+                        .border_l_1()
                         .border_color(cx.theme().colors().border)
                         .children(self.end_children),
                 )

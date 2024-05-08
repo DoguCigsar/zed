@@ -5,18 +5,26 @@ edition = "2021"
 publish = false
 license = "GPL-3.0-or-later"
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/rope.rs"
 
 [dependencies]
 arrayvec = "0.7.1"
-bromberg_sl2 = { git = "https://github.com/zed-industries/bromberg_sl2", rev = "950bc5482c216c395049ae33ae4501e08975f17f" }
 log.workspace = true
 smallvec.workspace = true
-sum_tree = { path = "../sum_tree" }
-util = { path = "../util" }
+sum_tree.workspace = true
+unicode-segmentation.workspace = true
+util.workspace = true
 
 [dev-dependencies]
-gpui = { path = "../gpui", features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
 rand.workspace = true
-util = { path = "../util", features = ["test-support"] }
+util = { workspace = true, features = ["test-support"] }
+criterion = { version = "0.4", features = ["html_reports"] }
+
+[[bench]]
+name = "rope_benchmark"
+harness = false

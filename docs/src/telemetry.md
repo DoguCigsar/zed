@@ -4,11 +4,24 @@
 
 Zed collects anonymous telemetry data to help the team understand how people are using the application and to see what sort of issues they are experiencing.
 
+## Configuring Telemetry Settings
+
+You have full control over what data is sent out by Zed. To enable or disable some or all telemetry types, open your `settings.json` file via `zed: open settings` from the command palette. Insert and tweak the following:
+
+```json
+"telemetry": {
+    "diagnostics": false,
+    "metrics": false
+},
+```
+
+The telemetry settings can also be configured via the `welcome` screen, which can be invoked via the `workspace: welcome` action in the command palette.
+
 ## Dataflow
 
-Telemetry is sent from the application to zed.dev. Data is proxied through our servers to enable us to easily switch analytics services; we never store this data. The data is then sent off to various services:
+Telemetry is sent from the application to our servers. Data is proxied through our servers to enable us to easily switch analytics services. We currently use:
 
-- [Datadog](https://www.datadoghq.com): Cloud-monitoring service - stores diagnostic events
+- [Axiom](https://axiom.co): Cloud-monitoring service - stores diagnostic events
 - [Clickhouse](https://clickhouse.com): Business Intelligence platform - stores both diagnostic and metric events
 - [Metabase](https://www.metabase.com): Dashboards - dashboards built around data pulled from Clickhouse
 
@@ -128,17 +141,6 @@ The following data is sent:
   - `milliseconds_since_first_event`: Same as above
 
 You can audit the metrics data that Zed has reported by running the command `zed: open telemetry log` from the command palette, or clicking `Help > View Telemetry Log` in the application menu.
-
-### Configuring Telemetry Settings
-
-You have full control over what data is sent out by Zed. To enable or disable some or all telemetry types, open your `settings.json` file via `zed: open settings` from the command palette. Insert and tweak the following:
-
-```json
-"telemetry": {
-    "diagnostics": false,
-    "metrics": false
-},
-```
 
 The telemetry settings can also be configured via the `welcome` screen, which can be invoked via the `workspace: welcome` action in the command palette.
 

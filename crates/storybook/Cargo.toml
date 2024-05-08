@@ -5,38 +5,36 @@ edition = "2021"
 publish = false
 license = "GPL-3.0-or-later"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "storybook"
 path = "src/storybook.rs"
 
 [dependencies]
 anyhow.workspace = true
-# TODO: Remove after diagnosing stack overflow.
-backtrace-on-stack-overflow = "0.3.0"
-chrono = "0.4"
-clap = { version = "4.4", features = ["derive", "string"] }
-collab_ui = { path = "../collab_ui", features = ["stories"] }
+assistant2 = { workspace = true, features = ["stories"] }
+clap = { workspace = true, features = ["derive", "string"] }
+collab_ui = { workspace = true, features = ["stories"] }
 ctrlc = "3.4"
 dialoguer = { version = "0.11.0", features = ["fuzzy-select"] }
-editor = { path = "../editor" }
-fuzzy = {  path = "../fuzzy" }
-gpui = { path = "../gpui" }
+editor.workspace = true
+fuzzy.workspace = true
+gpui.workspace = true
 indoc.workspace = true
-itertools = "0.11.0"
-language = { path = "../language" }
+language.workspace = true
 log.workspace = true
-menu = { path = "../menu" }
-picker = { path = "../picker" }
+menu.workspace = true
+picker.workspace = true
+project.workspace = true
 rust-embed.workspace = true
-serde.workspace = true
-settings = { path = "../settings" }
+settings.workspace = true
 simplelog = "0.9"
-smallvec.workspace = true
-story = { path = "../story" }
+story.workspace = true
 strum = { version = "0.25.0", features = ["derive"] }
-theme = { path = "../theme" }
-ui = { path = "../ui", features = ["stories"] }
-util = { path = "../util" }
+theme.workspace = true
+ui = { workspace = true, features = ["stories"] }
 
 [dev-dependencies]
-gpui = { path = "../gpui", features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
