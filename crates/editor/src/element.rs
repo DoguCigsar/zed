@@ -15,8 +15,8 @@ use crate::{
     CodeActionsMenu, CursorShape, DisplayPoint, DocumentHighlightRead, DocumentHighlightWrite,
     Editor, EditorMode, EditorSettings, EditorSnapshot, EditorStyle, ExpandExcerpts,
     GutterDimensions, HalfPageDown, HalfPageUp, HoveredCursor, HunkToExpand, LineDown, LineUp,
-    OpenExcerpts, PageDown, PageUp, Point, RunnableTasks, SelectPhase, Selection, SoftWrap,
-    ToPoint, CURSORS_VISIBLE_FOR, MAX_LINE_LEN,
+    OpenExcerpts, PageDown, PageUp, Point, SelectPhase, Selection, SoftWrap, ToPoint,
+    CURSORS_VISIBLE_FOR, MAX_LINE_LEN,
 };
 use anyhow::Result;
 use client::ParticipantIndex;
@@ -638,7 +638,7 @@ impl EditorElement {
             editor.update_hovered_link(point_for_position, &position_map.snapshot, modifiers, cx);
 
             if let Some(point) = point_for_position.as_valid() {
-                hover_at(editor, Some(point), cx);
+                hover_at(editor, Some((point, &position_map.snapshot)), cx);
                 Self::update_visible_cursor(editor, point, position_map, cx);
             } else {
                 hover_at(editor, None, cx);
@@ -1377,16 +1377,14 @@ impl EditorElement {
 
     fn layout_run_indicators(
         &self,
-        task_lines: Vec<(u32, RunnableTasks)>,
         line_height: Pixels,
         scroll_pixel_position: gpui::Point<Pixels>,
         gutter_dimensions: &GutterDimensions,
         gutter_hitbox: &Hitbox,
+        snapshot: &EditorSnapshot,
         cx: &mut WindowContext,
     ) -> Vec<AnyElement> {
         self.editor.update(cx, |editor, cx| {
-            editor.clear_tasks();
-
             let active_task_indicator_row =
                 if let Some(crate::ContextMenu::CodeActions(CodeActionsMenu {
                     deployed_from_indicator,
@@ -1402,21 +1400,22 @@ impl EditorElement {
                 } else {
                     None
                 };
-            task_lines
-                .into_iter()
-                .map(|(row, tasks)| {
-                    editor.insert_tasks(row, tasks);
-
+            editor
+                .tasks
+                .keys()
+                .map(|row| {
                     let button = editor.render_run_indicator(
                         &self.style,
-                        Some(row) == active_task_indicator_row,
-                        row,
+                        Some(*row) == active_task_indicator_row,
+                        *row,
                         cx,
                     );
-
+                    let display_row = Point::new(*row, 0)
+                        .to_display_point(&snapshot.display_snapshot)
+                        .row();
                     let button = prepaint_gutter_button(
                         button,
-                        row,
+                        display_row,
                         line_height,
                         gutter_dimensions,
                         scroll_pixel_position,
@@ -1817,7 +1816,7 @@ impl EditorElement {
                                     .pr(gpui::px(8.))
                                     .rounded_md()
                                     .shadow_md()
-                                    .border()
+                                    .border_1()
                                     .border_color(cx.theme().colors().border)
                                     .bg(cx.theme().colors().editor_subheader_background)
                                     .justify_between()
@@ -2083,6 +2082,10 @@ impl EditorElement {
             crate::ContextMenuOrigin::GutterIndicator(row) => {
                 // Context menu was spawned via a click on a gutter. Ensure it's a bit closer to the indicator than just a plain first column of the
                 // text field.
+                let snapshot = self.editor.update(cx, |this, cx| this.snapshot(cx));
+                let row = Point::new(row, 0)
+                    .to_display_point(&snapshot.display_snapshot)
+                    .row();
                 let x = -gutter_overshoot;
                 let y = (row + 1) as f32 * line_height - scroll_pixel_position.y;
                 (x, y)
@@ -3364,8 +3367,7 @@ fn render_blame_entry(
 
     let relative_timestamp = blame_entry_relative_timestamp(&blame_entry, cx);
 
-    let pretty_commit_id = format!("{}", blame_entry.sha);
-    let short_commit_id = pretty_commit_id.chars().take(6).collect::<String>();
+    let short_commit_id = blame_entry.sha.display_short();
 
     let author_name = blame_entry.author.as_deref().unwrap_or("<no name>");
     let name = util::truncate_and_trailoff(author_name, 20);
@@ -3835,12 +3837,6 @@ impl Element for EditorElement {
                     cx,
                 );
 
-                let test_lines = self.editor.read(cx).runnable_display_rows(
-                    start_anchor..end_anchor,
-                    &snapshot.display_snapshot,
-                    cx,
-                );
-
                 let (selections, active_rows, newest_selection_head) = self.layout_selections(
                     start_anchor,
                     end_anchor,
@@ -4030,9 +4026,13 @@ impl Element for EditorElement {
                             cx,
                         );
                         if gutter_settings.code_actions {
-                            let has_test_indicator = test_lines
-                                .iter()
-                                .any(|(line, _)| *line == newest_selection_head.row());
+                            let newest_selection_point =
+                                newest_selection_head.to_point(&snapshot.display_snapshot);
+                            let has_test_indicator = self
+                                .editor
+                                .read(cx)
+                                .tasks
+                                .contains_key(&newest_selection_point.row);
                             if !has_test_indicator {
                                 code_actions_indicator = self.layout_code_actions_indicator(
                                     line_height,
@@ -4048,11 +4048,11 @@ impl Element for EditorElement {
                 }
 
                 let test_indicators = self.layout_run_indicators(
-                    test_lines,
                     line_height,
                     scroll_pixel_position,
                     &gutter_dimensions,
                     &gutter_hitbox,
+                    &snapshot,
                     cx,
                 );
 
